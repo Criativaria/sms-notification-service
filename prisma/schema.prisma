@@ -1,0 +1,126 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum SmsMessageStatus {
+  QUEUED
+  PROCESSING
+  AWAITING_PROVIDER_RESULT
+  RETRY_SCHEDULED
+  SENT
+  DELIVERED
+  UNDELIVERED
+  REJECTED
+  FATAL_FAILURE
+}
+
+enum SmsAttemptOutcome {
+  RESERVED
+  ACCEPTED
+  FAILED
+  TIMEOUT
+}
+
+enum SmsAttemptResolutionType {
+  KNOWN_SID
+  UNDELIVERED
+}
+
+enum SmsUndeliveredEvidenceCode {
+  TWILIO_UNDELIVERED_CONFIRMED
+}
+
+model SmsMessage {
+  id                 String           @id @default(uuid()) @db.Uuid
+  idempotencyKey     String
+  recipientPhone     String
+  encryptedMessage   String           @db.Text
+  metadata           Json?
+  status             SmsMessageStatus @default(QUEUED)
+  selectedProvider   String?
+  providerMessageId  String?
+  lastError          String?          @db.Text
+  deliveryAttempts   Int              @default(0)
+  retryRounds        Int              @default(0)
+  retentionExpiresAt DateTime
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  attempts           SmsAttempt[]
+  attemptResolutions SmsAttemptResolution[]
+  outboxEvents       OutboxEvent[]
+  idempotencyOwner   SmsIdempotencyKey?
+
+  @@index([idempotencyKey])
+  @@index([providerMessageId])
+  @@index([retentionExpiresAt])
+  @@map("sms_messages")
+}
+
+model SmsIdempotencyKey {
+  key          String     @id
+  smsMessageId String     @unique @db.Uuid
+  expiresAt    DateTime
+  createdAt    DateTime   @default(now())
+  smsMessage   SmsMessage @relation(fields: [smsMessageId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("sms_idempotency_keys")
+}
+
+model SmsAttempt {
+  id                String            @id @default(uuid()) @db.Uuid
+  smsMessageId      String            @db.Uuid
+  provider          String
+  providerMessageId String?
+  outcome           SmsAttemptOutcome
+  isRetryable       Boolean
+  isAmbiguous       Boolean           @default(false)
+  httpStatus        Int?
+  errorCode         String?
+  errorMessage      String?           @db.Text
+  createdAt         DateTime          @default(now())
+  smsMessage        SmsMessage        @relation(fields: [smsMessageId], references: [id], onDelete: Restrict)
+  resolution        SmsAttemptResolution?
+
+  @@index([smsMessageId, createdAt])
+  @@index([provider, providerMessageId])
+  @@map("sms_attempts")
+}
+
+model SmsAttemptResolution {
+  id                String                     @id @default(uuid()) @db.Uuid
+  smsMessageId      String                     @db.Uuid
+  smsAttemptId      String                     @unique @db.Uuid
+  resolution        SmsAttemptResolutionType
+  providerMessageId String?
+  evidenceCode      SmsUndeliveredEvidenceCode?
+  createdAt         DateTime                   @default(now())
+  smsMessage        SmsMessage                 @relation(fields: [smsMessageId], references: [id], onDelete: Restrict)
+  smsAttempt        SmsAttempt                 @relation(fields: [smsAttemptId], references: [id], onDelete: Restrict)
+
+  @@index([smsMessageId, createdAt])
+  @@map("sms_attempt_resolutions")
+}
+
+model OutboxEvent {
+  id            String     @id @default(uuid()) @db.Uuid
+  aggregateType String
+  aggregateId   String     @db.Uuid
+  eventType     String
+  payload       Json
+  publishedAt   DateTime?
+  retryCount    Int        @default(0)
+  lastError     String?    @db.Text
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  smsMessage    SmsMessage @relation(fields: [aggregateId], references: [id], onDelete: Restrict)
+
+  @@index([publishedAt, createdAt])
+  @@index([aggregateType, aggregateId])
+  @@map("outbox_events")
+}

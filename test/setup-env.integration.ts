@@ -1,0 +1,14 @@
+process.env.SERVICE_URL = 'http://localhost:3000';
+process.env.PRIVATE_NETWORK_CIDRS = '127.0.0.1/32,::1/128';
+process.env.DATABASE_URL =
+  'postgresql://sms_user:local_development_password@localhost:5432/sms_notification?schema=public';
+process.env.REDIS_URL = 'redis://localhost:6379';
+process.env.SMS_PROVIDER_PRIORITY = 'twilio,bird';
+process.env.TWILIO_ACCOUNT_SID = 'test-account-sid';
+process.env.TWILIO_AUTH_TOKEN = 'test-auth-token';
+process.env.TWILIO_FROM_NUMBER = '+14155552671';
+process.env.BIRD_API_KEY = 'test-bird-api-key';
+process.env.BIRD_WORKSPACE_ID = 'test-bird-workspace';
+process.env.BIRD_CHANNEL_ID = 'test-bird-channel';
+process.env.BIRD_WEBHOOK_SIGNING_KEY = 'test-bird-webhook-key';
+process.env.ENCRYPTION_KEY = Buffer.alloc(32).toString('base64');

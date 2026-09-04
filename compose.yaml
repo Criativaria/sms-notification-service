@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: sms_notification
+      POSTGRES_USER: sms_user
+      POSTGRES_PASSWORD: local_development_password
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U sms_user -d sms_notification']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local mock of Bird's Messages API — demo/dev only, no real Bird credentials involved.
+  # See mock-servers/bird/server.ts and docs/provider-sandbox.md for the contract and demo steps.
+  bird-mock:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: sh -c "npx ts-node mock-servers/bird/server.ts"
+    environment:
+      PORT: 8081
+      # The main app runs on the host (npm run start:dev), not in this compose network, so the
+      # mock reaches it via host.docker.internal. Override with BIRD_MOCK_SERVICE_URL if needed.
+      SERVICE_URL: ${BIRD_MOCK_SERVICE_URL:-http://host.docker.internal:3000}
+      BIRD_WEBHOOK_SIGNING_KEY: ${BIRD_WEBHOOK_SIGNING_KEY:-test-bird-webhook-key}
+    ports:
+      - '8081:8081'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+volumes:
+  postgres_data:
