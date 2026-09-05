@@ -22,36 +22,37 @@ provider webhooks never produce `FATAL_FAILURE`.
 Queues:
 
 - `sms-dispatch` — normal delivery jobs.
-- `sms-dlq` — dead-lettered jobs.
+- `sms-dlq` — ephemeral dead-letter notifications. Its worker records a PII-safe log/metric and
+  completes each notification; BullMQ removes completed and failed jobs.
 
 Every job ID is the originating outbox event ID. Replaying an unpublished event therefore safely
 reuses its BullMQ job ID, while a later retry, DLQ, or administrative requeue receives a fresh ID.
 
-The application has no consumer for `sms-dlq`; operational requeue is performed through the
-PostgreSQL-backed HTTP endpoint below. It also has no configured Redis retention or cleanup for
-DLQ jobs, so Redis DLQ entries can accumulate independently of the 90-day PostgreSQL record
-retention policy.
+Operational requeue is performed only through the PostgreSQL-backed HTTP endpoint below. The
+DLQ worker and Redis job are not consulted: they may already have completed and been removed.
+All relay-created dispatch and DLQ jobs use BullMQ `removeOnComplete` and `removeOnFail`, so Redis
+queue storage does not retain completed or failed operational work indefinitely.
 
 ## Inspecting the DLQ
 
 A dead-lettered message is durably recorded in PostgreSQL. Inspect it there (the DB is the
-system of record — the `sms-dlq` queue is an operational artifact, not the source of truth). No PII is
+system of record — the `sms-dlq` queue is an ephemeral operational notification, not the source of truth). No PII is
 exposed by lifecycle projections; `lastError` holds the failure reason.
 
 ```sql
 -- Dead-lettered messages, newest first (no phone number or body selected)
-SELECT id, status, selected_provider, provider_message_id,
-       last_error, delivery_attempts, retry_rounds, updated_at
+SELECT id, status, "selectedProvider", "providerMessageId",
+       "lastError", "deliveryAttempts", "retryRounds", "updatedAt"
 FROM sms_messages
 WHERE status = 'FATAL_FAILURE'
-ORDER BY updated_at DESC;
+ORDER BY "updatedAt" DESC;
 
 -- Full provider attempt trail for one message (audit log)
-SELECT provider, outcome, is_retryable, is_ambiguous,
-       http_status, error_code, error_message, created_at
+SELECT provider, outcome, "isRetryable", "isAmbiguous",
+       "httpStatus", "errorCode", "errorMessage", "createdAt"
 FROM sms_attempts
-WHERE sms_message_id = '<messageId>'
-ORDER BY created_at ASC;
+WHERE "smsMessageId" = '<messageId>'
+ORDER BY "createdAt" ASC;
 ```
 
 Structured log lines for the same events (PII-safe) include:
@@ -77,7 +78,8 @@ normal state machine (where `FATAL_FAILURE` is terminal):
 - `lastError`: cleared to `null`
 
 The same transaction records a requeue outbox event. The relay later publishes a fresh
-`sms-dispatch` job, so Redis unavailability cannot lose the requeue intent. The message re-enters
+`sms-dispatch` job, so Redis unavailability cannot lose the requeue intent. This works whether
+the associated `sms-dlq` notification is waiting, completed, or already removed. The message re-enters
 the pipeline and is dispatched like a normal retry. A provider timeout during that replay remains
 an ambiguous delivery outcome: the provider may have accepted the original request, and a later
 failover or retry can produce a duplicate SMS.

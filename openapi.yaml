@@ -1,0 +1,530 @@
+openapi: 3.0.3
+info:
+  title: SMS Notification Microservice
+  version: '1.0.0'
+  description: |
+    NestJS microservice that accepts SMS send requests, dispatches them through a
+    provider-priority chain (Twilio, Bird), tracks delivery lifecycle via provider
+    webhooks, and exposes operational endpoints for dead-letter recovery and metrics.
+
+    ## Private-network endpoints
+    Routes under `/api/v1/sms`, `/internal/dlq`, and `/internal/metrics` are guarded by
+    `PrivateNetworkGuard`, which only allows callers whose source IP falls inside
+    `PRIVATE_NETWORK_CIDRS`. The shipped `.env.example` default
+    (`127.0.0.1/32,::1/128`) includes IPv4 and IPv6 loopback, so testing these routes
+    from Insomnia against `http://localhost:3000` works out of the box with no extra
+    configuration.
+
+    ## Webhook endpoints
+    `/webhooks/twilio` and `/webhooks/bird` require a valid provider HMAC signature
+    over the raw request body (`X-Twilio-Signature` / `X-Bird-Signature`). A bare
+    Insomnia POST without a correctly computed signature will always receive `403
+    Forbidden` — there is no way to hand-craft a valid signature without the shared
+    secret and the exact signing scheme. To exercise a real, validly signed Bird
+    webhook call end-to-end, use the local Bird mock server's
+    `POST /simulate-callback/:messageId` flow described in `docs/provider-sandbox.md`
+    ("Bird local mock server" section): it signs a delivery-report payload exactly the
+    way the service verifies it and forwards it to this service's `/webhooks/bird` for
+    you. Both webhook routes also return `404` when the corresponding provider is not
+    part of the deployment's configured `SMS_PROVIDER_PRIORITY` (e.g. `/webhooks/bird`
+    on a Twilio-only deployment), since the required signing secret is legitimately
+    absent in that case.
+servers:
+  - url: http://localhost:3000
+    description: Local development (default PORT from .env.example)
+tags:
+  - name: SMS
+    description: Sending outbound SMS messages.
+  - name: Webhooks
+    description: Provider delivery-status callbacks (Twilio, Bird). Require a valid HMAC signature.
+  - name: DLQ
+    description: Dead-letter-queue operational recovery.
+  - name: Operations
+    description: Health and metrics endpoints.
+
+paths:
+  /api/v1/sms/send:
+    post:
+      tags: [SMS]
+      summary: Queue an outbound SMS message
+      description: |
+        Accepts a message for asynchronous dispatch. Requires the caller to be inside
+        an allowed private-network CIDR (see `PrivateNetworkGuard`) and to supply a
+        unique `X-Idempotency-Key` header; a retried request with the same key and
+        body returns the original accepted result rather than sending twice.
+      operationId: sendSms
+      security:
+        - privateNetwork: []
+      parameters:
+        - name: X-Idempotency-Key
+          in: header
+          required: true
+          description: Client-supplied idempotency key. A missing or blank value is rejected with 400.
+          schema:
+            type: string
+            example: order-42-sms-1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendSmsRequest'
+      responses:
+        '202':
+          description: Message accepted and queued for dispatch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendSmsResponse'
+        '400':
+          description: |
+            Validation failure. Causes include: `to` not matching the E.164 format
+            (`^\+[1-9]\d{1,14}$`), an empty `message`, `message` longer than the
+            configured `MAX_MESSAGE_LENGTH` (default 160 characters), a non-object
+            `metadata`, `metadata` whose JSON-serialized size exceeds 4096 bytes
+            (`MAX_METADATA_BYTES`), or a missing/blank `X-Idempotency-Key` header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Caller is not within an allowed private-network CIDR.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webhooks/twilio:
+    post:
+      tags: [Webhooks]
+      summary: Twilio delivery-status callback
+      description: |
+        Receives Twilio's status callback as `application/x-www-form-urlencoded`.
+        Authenticated by recomputing Twilio's HMAC-SHA1 signature over the full
+        callback URL plus sorted form parameters, compared to `X-Twilio-Signature`.
+        Cannot be meaningfully invoked from Insomnia without computing that signature
+        using the real `TWILIO_AUTH_TOKEN` and callback URL.
+      operationId: twilioWebhook
+      parameters:
+        - name: X-Twilio-Signature
+          in: header
+          required: false
+          description: Base64 HMAC-SHA1 signature over the callback URL and sorted form params. Missing/invalid yields 403.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/TwilioStatusCallback'
+      responses:
+        '200':
+          description: Callback acknowledged (applied, duplicate, or ignored as a non-terminal status).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          description: Missing raw body or missing `MessageSid`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Invalid or missing Twilio signature.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Either the `providerMessageId` is unknown, or Twilio is not part of this
+            deployment's `SMS_PROVIDER_PRIORITY` (route reports not-found rather than
+            failing to construct, since `TWILIO_AUTH_TOKEN` is legitimately absent).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Delivery report conflicts with the message's current lifecycle status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /webhooks/bird:
+    post:
+      tags: [Webhooks]
+      summary: Bird delivery-status callback
+      description: |
+        Receives Bird's delivery-report payload as JSON. Authenticated by HMAC-SHA256
+        over the raw JSON request body using `BIRD_WEBHOOK_SIGNING_KEY`, compared to
+        `X-Bird-Signature`. Cannot be meaningfully invoked from Insomnia without
+        computing that signature. To trigger a genuinely valid signed call for manual
+        testing, use the Bird mock server's `POST /simulate-callback/:messageId`
+        endpoint documented in `docs/provider-sandbox.md`, which signs and forwards a
+        delivery-report payload to this endpoint for you.
+      operationId: birdWebhook
+      parameters:
+        - name: X-Bird-Signature
+          in: header
+          required: false
+          description: hex(HMAC-SHA256(BIRD_WEBHOOK_SIGNING_KEY, rawBody)). Missing/invalid yields 403.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BirdWebhookPayload'
+      responses:
+        '200':
+          description: Callback acknowledged (applied, duplicate, or ignored as a non-terminal status).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookAck'
+        '400':
+          description: Missing raw body, invalid JSON, or missing message correlation id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Invalid or missing Bird signature.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: |
+            Either the `providerMessageId` is unknown, or Bird is not part of this
+            deployment's `SMS_PROVIDER_PRIORITY` (route reports not-found rather than
+            failing to construct, since `BIRD_WEBHOOK_SIGNING_KEY` is legitimately
+            absent).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Delivery report conflicts with the message's current lifecycle status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /internal/dlq/{messageId}/requeue:
+    post:
+      tags: [DLQ]
+      summary: Requeue a dead-lettered message
+      description: |
+        Administrative override that resets a `FATAL_FAILURE` message back to
+        `RETRY_SCHEDULED` (restoring a full retry budget) and records a requeue
+        outbox intent. Only messages currently in `FATAL_FAILURE` may be requeued.
+      operationId: requeueDlqMessage
+      security:
+        - privateNetwork: []
+      parameters:
+        - name: messageId
+          in: path
+          required: true
+          schema:
+            type: string
+          example: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+      responses:
+        '202':
+          description: Message reset and requeued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequeueResponse'
+        '403':
+          description: Caller is not within an allowed private-network CIDR.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: SMS message not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Message is not currently in `FATAL_FAILURE` status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health:
+    get:
+      tags: [Operations]
+      summary: Liveness check
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+                example:
+                  status: ok
+
+  /internal/metrics:
+    get:
+      tags: [Operations]
+      summary: Operational metrics snapshot
+      description: |
+        Returns in-memory counters and live queue/outbox gauges. Counters reset on
+        process restart; gauges are read live from BullMQ and the outbox table.
+      operationId: getMetrics
+      security:
+        - privateNetwork: []
+      responses:
+        '200':
+          description: Metrics snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsSnapshot'
+        '403':
+          description: Caller is not within an allowed private-network CIDR.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  securitySchemes:
+    privateNetwork:
+      type: apiKey
+      in: header
+      name: X-Not-A-Real-Header
+      description: |
+        Not an actual credential — this route is gated by source-IP CIDR matching
+        (`PrivateNetworkGuard`), not a header or token. Documented here only so the
+        restriction is visible in tooling. Requests from `localhost` are allowed by
+        the default `PRIVATE_NETWORK_CIDRS=127.0.0.1/32,::1/128`.
+
+  schemas:
+    SendSmsRequest:
+      type: object
+      required: [to, message]
+      properties:
+        to:
+          type: string
+          description: Recipient phone number in strict E.164 format.
+          pattern: '^\+[1-9]\d{1,14}$'
+          example: '+14155552671'
+        message:
+          type: string
+          description: Message body. Rejected if empty or longer than the configured MAX_MESSAGE_LENGTH (default 160).
+          minLength: 1
+          example: Your verification code is 123456.
+        metadata:
+          type: object
+          description: |
+            Optional free-form metadata. Must be a plain JSON object whose
+            serialized size is at most 4096 bytes (MAX_METADATA_BYTES), with
+            additional service-side bounds (max 20 keys, key length <= 64, string
+            values <= 256 chars, nesting depth <= 4).
+          additionalProperties: true
+          example:
+            orderId: order-42
+            campaign: welcome-sms
+
+    SendSmsResponse:
+      type: object
+      required: [status, data]
+      properties:
+        status:
+          type: string
+          enum: [success]
+        data:
+          $ref: '#/components/schemas/AcceptedSmsResult'
+      example:
+        status: success
+        data:
+          messageId: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+          status: QUEUED
+          createdAt: '2026-09-04T12:00:00.000Z'
+
+    AcceptedSmsResult:
+      type: object
+      required: [messageId, status, createdAt]
+      properties:
+        messageId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          description: Lifecycle status at acceptance time (e.g. QUEUED). Unchanged if this idempotency key was already seen.
+        createdAt:
+          type: string
+          format: date-time
+
+    RequeueResponse:
+      type: object
+      required: [messageId, status]
+      properties:
+        messageId:
+          type: string
+        status:
+          type: string
+          enum: [requeued]
+      example:
+        messageId: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+        status: requeued
+
+    WebhookAck:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, ignored]
+          description: '"ignored" means the provider status was non-terminal and no state change was made.'
+      example:
+        status: ok
+
+    TwilioStatusCallback:
+      type: object
+      description: Subset of Twilio's status-callback form fields actually read by this service.
+      properties:
+        MessageSid:
+          type: string
+          description: Provider message id; used to look up the message.
+          example: SM1234567890abcdef1234567890abcdef
+        MessageStatus:
+          type: string
+          description: 'Twilio delivery status. Mapped: delivered, undelivered, failed. Other values are acknowledged but ignored.'
+          example: delivered
+        SmsSid:
+          type: string
+          description: Optional provider event id, recorded for traceability.
+          example: SM0987654321fedcba0987654321fedcba
+
+    BirdWebhookPayload:
+      type: object
+      description: |
+        Bird delivery-report payload. Correlation id is read from `id` (fallback
+        `messageId`, then `message.id`); status from `status` (fallback
+        `message.status`).
+      properties:
+        id:
+          type: string
+          example: bird-mock-3fa85f64-5717-4562-b3fc-2c963f66afa6
+        messageId:
+          type: string
+        status:
+          type: string
+          description: 'Mapped: delivered, delivery_failed, failed, undelivered, rejected. Other values are acknowledged but ignored.'
+          example: delivered
+        eventId:
+          type: string
+        message:
+          type: object
+          properties:
+            id:
+              type: string
+            status:
+              type: string
+      example:
+        id: bird-mock-3fa85f64-5717-4562-b3fc-2c963f66afa6
+        status: delivered
+        eventId: evt-123
+
+    MetricsSnapshot:
+      type: object
+      required: [gauges, counters]
+      properties:
+        gauges:
+          type: object
+          required: [dispatchQueue, outboxUnpublished, deadLetterQueue]
+          properties:
+            dispatchQueue:
+              $ref: '#/components/schemas/QueueGauges'
+            outboxUnpublished:
+              type: integer
+              example: 0
+            deadLetterQueue:
+              $ref: '#/components/schemas/QueueGauges'
+        counters:
+          type: object
+          required:
+            - providerAttempts
+            - providerErrors
+            - failovers
+            - deadLetters
+            - deadLetterNotifications
+            - processingLatency
+          properties:
+            providerAttempts:
+              type: integer
+              example: 12
+            providerErrors:
+              type: integer
+              example: 1
+            failovers:
+              type: integer
+              example: 0
+            deadLetters:
+              type: integer
+              example: 0
+            deadLetterNotifications:
+              type: integer
+              example: 0
+            processingLatency:
+              type: object
+              required: [count, totalMs, averageMs]
+              properties:
+                count:
+                  type: integer
+                  example: 12
+                totalMs:
+                  type: number
+                  example: 4820
+                averageMs:
+                  type: number
+                  example: 401.6
+
+    QueueGauges:
+      type: object
+      required: [waiting, delayed, active]
+      properties:
+        waiting:
+          type: integer
+          example: 0
+        delayed:
+          type: integer
+          example: 0
+        active:
+          type: integer
+          example: 0
+
+    ErrorResponse:
+      type: object
+      description: Default NestJS HTTP exception response shape.
+      required: [statusCode, message]
+      properties:
+        statusCode:
+          type: integer
+          example: 400
+        message:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+          example: 'X-Idempotency-Key header is required'
+        error:
+          type: string
+          example: Bad Request

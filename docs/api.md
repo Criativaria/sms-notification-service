@@ -3,17 +3,24 @@
 All routes are served from the service root (no global path prefix). Base URL in local
 development is `http://localhost:3000`.
 
-| Method | Path | Purpose | Network |
-| ------ | ---- | ------- | ------- |
-| `GET`  | `/health` | Liveness probe | Public |
-| `POST` | `/api/v1/sms/send` | Accept an SMS for delivery | Private-network only |
-| `POST` | `/webhooks/twilio` | Twilio delivery-status callback | Public (signature-verified) |
-| `POST` | `/webhooks/bird` | Bird delivery-status callback | Public (signature-verified) |
-| `POST` | `/internal/dlq/:messageId/requeue` | Replay a dead-lettered message | Private-network only |
+| Method | Path                               | Purpose                         | Network                     |
+| ------ | ---------------------------------- | ------------------------------- | --------------------------- |
+| `GET`  | `/health`                          | Liveness probe                  | Public                      |
+| `POST` | `/api/v1/sms/send`                 | Accept an SMS for delivery      | Private-network only        |
+| `POST` | `/webhooks/twilio`                 | Twilio delivery-status callback | Public (signature-verified) |
+| `POST` | `/webhooks/bird`                   | Bird delivery-status callback   | Public (signature-verified) |
+| `POST` | `/internal/dlq/:messageId/requeue` | Replay a dead-lettered message  | Private-network only        |
+| `GET`  | `/internal/metrics`                 | Queue and delivery metrics      | Private-network only        |
 
 Private-network routes are gated by `PrivateNetworkGuard`, which matches the socket remote
 address (never `X-Forwarded-For`) against `PRIVATE_NETWORK_CIDRS`. A caller outside those
 CIDRs receives `403 Forbidden`.
+
+## GET /internal/metrics
+
+Returns live queue/outbox/DLQ gauges and process-lifetime counters for provider attempts,
+provider errors, failovers, dead letters, and dispatch processing latency. It contains no message
+content or recipient data. Counters reset when the service process restarts.
 
 ---
 
@@ -24,18 +31,18 @@ provider delivery happens asynchronously via the outbox relay and dispatch worke
 
 ### Headers
 
-| Header | Required | Notes |
-| ------ | -------- | ----- |
-| `X-Idempotency-Key` | Yes | Non-empty (trimmed) string. Missing or blank -> `400`. Valid for 24 hours; reusing a live key returns the original record and never re-sends. |
-| `Content-Type` | Yes | `application/json` |
+| Header              | Required | Notes                                                                                                                                               |
+| ------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `X-Idempotency-Key` | Yes      | Non-empty (trimmed) string. Missing or blank -> `400`. Valid for 24 hours; reusing an unexpired key returns the original record and never re-sends. |
+| `Content-Type`      | Yes      | `application/json`                                                                                                                                  |
 
 ### Body
 
-| Field | Type | Required | Validation |
-| ----- | ---- | -------- | ---------- |
-| `to` | string | Yes | Strict E.164: `^\+[1-9]\d{1,14}$` |
-| `message` | string | Yes | Non-empty; length `<= MAX_MESSAGE_LENGTH` (default 160). Enforced in the service against runtime config, not a static decorator. |
-| `metadata` | object | No | Arbitrary JSON object |
+| Field      | Type   | Required | Validation                                                                                                                       |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `to`       | string | Yes      | Strict E.164: `^\+[1-9]\d{1,14}$`                                                                                                |
+| `message`  | string | Yes      | Non-empty; length `<= MAX_MESSAGE_LENGTH` (default 160). Enforced in the service against runtime config, not a static decorator. |
+| `metadata` | object | No       | Arbitrary JSON object                                                                                                            |
 
 The global `ValidationPipe` runs with `whitelist: true`, so unknown body properties are
 stripped rather than rejected.
@@ -71,7 +78,7 @@ newly created message, or the original status when an idempotency key is replaye
 
 - The idempotency key, the message row, and the outbox event are written in a single
   transaction, so a message can never be enqueued without its durable record.
-- A repeat request with the **same live key** returns the original `messageId`/`status`/
+- A repeat request with the **same unexpired key** returns the original `messageId`/`status`/
   `createdAt` with `202` and enqueues nothing new.
 - Once a key's 24-hour window has expired, the same key value creates a fresh message.
 - A concurrent duplicate that loses the unique-constraint race is retried transparently and
@@ -79,12 +86,12 @@ newly created message, or the original status when an idempotency key is replaye
 
 ### Validation errors — 400 Bad Request
 
-| Cause | Message |
-| ----- | ------- |
-| Missing/blank `X-Idempotency-Key` | `X-Idempotency-Key header is required` |
-| Invalid `to` | `to must be a valid E.164 phone number` |
-| Empty `message` | `message should not be empty` |
-| `message` too long | `message must be at most 160 characters` (reflects the configured limit) |
+| Cause                             | Message                                                                  |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| Missing/blank `X-Idempotency-Key` | `X-Idempotency-Key header is required`                                   |
+| Invalid `to`                      | `to must be a valid E.164 phone number`                                  |
+| Empty `message`                   | `message should not be empty`                                            |
+| `message` too long                | `message must be at most 160 characters` (reflects the configured limit) |
 
 ```json
 {
@@ -96,8 +103,8 @@ newly created message, or the original status when an idempotency key is replaye
 
 ### Other responses
 
-| Status | Cause |
-| ------ | ----- |
+| Status          | Cause                                                |
+| --------------- | ---------------------------------------------------- |
 | `403 Forbidden` | Caller is not within an allowed private-network CIDR |
 
 ---
@@ -129,11 +136,11 @@ Both return `200 OK` with one of:
 - Correlation id comes from the `MessageSid` form field (persisted as `providerMessageId`).
 - Status mapping (`MessageStatus`, case-insensitive):
 
-  | Twilio status | Canonical |
-  | ------------- | --------- |
-  | `delivered` | `DELIVERED` |
-  | `undelivered` | `UNDELIVERED` |
-  | `failed` | `REJECTED` |
+  | Twilio status | Canonical           |
+  | ------------- | ------------------- |
+  | `delivered`   | `DELIVERED`         |
+  | `undelivered` | `UNDELIVERED`       |
+  | `failed`      | `REJECTED`          |
   | anything else | ignored (no change) |
 
 ### POST /webhooks/bird
@@ -145,22 +152,22 @@ Both return `200 OK` with one of:
   Status read from `status`, falling back to `message.status`.
 - Status mapping (case-insensitive):
 
-  | Bird status | Canonical |
-  | ----------- | --------- |
-  | `delivered` | `DELIVERED` |
-  | `delivery_failed`, `failed`, `undelivered` | `UNDELIVERED` |
-  | `rejected` | `REJECTED` |
-  | anything else | ignored (no change) |
+  | Bird status                                | Canonical           |
+  | ------------------------------------------ | ------------------- |
+  | `delivered`                                | `DELIVERED`         |
+  | `delivery_failed`, `failed`, `undelivered` | `UNDELIVERED`       |
+  | `rejected`                                 | `REJECTED`          |
+  | anything else                              | ignored (no change) |
 
 ### Webhook response codes
 
-| Status | Cause |
-| ------ | ----- |
-| `200 OK` | Applied, duplicate (same-state repeat callback), or ignored (non-terminal status) |
+| Status            | Cause                                                                                        |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| `200 OK`          | Applied, duplicate (same-state repeat callback), or ignored (non-terminal status)            |
 | `400 Bad Request` | Missing raw body; missing `MessageSid` (Twilio) / correlation id (Bird); invalid JSON (Bird) |
-| `403 Forbidden` | Signature missing or invalid |
-| `404 Not Found` | No message matches the provider correlation id |
-| `409 Conflict` | Reported status conflicts with the current lifecycle status (invalid transition) |
+| `403 Forbidden`   | Signature missing or invalid                                                                 |
+| `404 Not Found`   | No message matches the provider correlation id                                               |
+| `409 Conflict`    | Reported status conflicts with the current lifecycle status (invalid transition)             |
 
 A repeated callback that reports the **same** status the message already holds returns `200`
 (`duplicate`), making webhook processing idempotent.
@@ -191,8 +198,8 @@ The relay publishes the fresh dispatch job after commit.
 
 ### Other responses
 
-| Status | Cause |
-| ------ | ----- |
-| `403 Forbidden` | Caller is not within an allowed private-network CIDR |
-| `404 Not Found` | No message with that id |
-| `409 Conflict` | Message is not in `FATAL_FAILURE` (only dead-lettered messages can be requeued) |
+| Status          | Cause                                                                           |
+| --------------- | ------------------------------------------------------------------------------- |
+| `403 Forbidden` | Caller is not within an allowed private-network CIDR                            |
+| `404 Not Found` | No message with that id                                                         |
+| `409 Conflict`  | Message is not in `FATAL_FAILURE` (only dead-lettered messages can be requeued) |

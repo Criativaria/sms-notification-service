@@ -23,7 +23,7 @@ the delivery paths that cannot be exercised without live provider accounts.
    it hands you (for example `https://<subdomain>.example-tunnel.dev`). `SERVICE_URL` must
    match exactly, because the Twilio signature is computed over `SERVICE_URL + /webhooks/twilio`.
    Restart the service so the new `SERVICE_URL` takes effect.
-3. **Register the status callback.** Configure the Twilio number / messaging service to POST
+3. **Register the status callback.** Configure the Twilio phone number or Messaging Service to POST
    delivery status callbacks to `https://<public-origin>/webhooks/twilio`.
 4. **Send a real message** from a private-network host:
    ```bash
@@ -36,23 +36,28 @@ the delivery paths that cannot be exercised without live provider accounts.
    once Twilio accepts it, then advance to `DELIVERED` (or `UNDELIVERED` / `REJECTED`) when
    the signed status callback arrives at `/webhooks/twilio`. Confirm via the database:
    ```sql
-   SELECT id, status, selected_provider, provider_message_id, updated_at
-   FROM sms_messages WHERE idempotency_key = 'sandbox-twilio-001';
+   SELECT id, status, "selectedProvider", "providerMessageId", "updatedAt"
+   FROM sms_messages WHERE "idempotencyKey" = 'sandbox-twilio-001';
    ```
    A valid signature yields `200 {"status":"ok"}`; an invalid one yields `403`.
 
-## Bird sandbox walkthrough — ASSUMPTION PENDING REAL DOCS
+## Bird sandbox walkthrough — optional, not required for acceptance
 
-The service currently verifies Bird callbacks with an **assumed** scheme:
+Bird is a paid API with no free sandbox for this project. Per the challenge author's explicit
+clarification, mocking a provider's API from its official documentation is an accepted
+approach, and mocking alone is sufficient when a real sandbox is not obtainable. The
+[local Bird mock server](#bird-local-mock-server-for-demo--no-live-bird-credentials) below is
+therefore the intended, sufficient implementation for Bird in this project — this walkthrough
+is kept only as an optional path for later, if real Bird access is ever obtained.
+
+The service verifies Bird callbacks with this scheme, built from Bird's public documentation:
 
 - Header: `X-Bird-Signature`
 - Signature: `hex(HMAC-SHA256(BIRD_WEBHOOK_SIGNING_KEY, rawRequestBody))`
 
-Bird's real signing scheme, header name, and delivery-report payload shape are **not
-confirmed** (no live Bird docs/credentials were available). Treat the Bird path as
-provisional until verified against real Bird documentation and a live account.
-
-To verify once real Bird access is available:
+This has not been independently re-verified against a live Bird account, since none was
+required. If real Bird access is obtained later, reconcile the scheme against Bird's actual
+signing/header/payload contract using the steps below.
 
 1. Set `SMS_PROVIDER_PRIORITY=bird` and real `BIRD_API_KEY`, `BIRD_WORKSPACE_ID`,
    `BIRD_CHANNEL_ID`, `BIRD_WEBHOOK_SIGNING_KEY`.
@@ -72,10 +77,12 @@ To verify once real Bird access is available:
 
 ## Bird local mock server (for demo / no live Bird credentials)
 
-Bird's API is paid, so for local development and the live demo we run a small standalone
-mock of the Bird Messages API instead of using real credentials. Source:
-`mock-servers/bird/server.ts`. It is a throwaway helper for this presentation, not a
-maintained service — no real Bird account, workspace, or channel is involved.
+Bird's API is paid with no free sandbox available for this project. Per the challenge author's
+explicit clarification, a mock built from the provider's official documentation is an accepted
+approach, and mocking is already sufficient when a real sandbox cannot be obtained — so for
+local development and the live demo we run a small standalone mock of the Bird Messages API
+instead of using real credentials. Source: `mock-servers/bird/server.ts`. No real Bird account,
+workspace, or channel is involved.
 
 ### What it implements
 
@@ -110,7 +117,7 @@ This runs `npx ts-node mock-servers/bird/server.ts` inside a `node:22-alpine` co
 the repo bind-mounted, listening on `http://localhost:8081`. It reaches the main app (which
 runs on the host via `npm run start:dev`, not in this compose network) at
 `http://host.docker.internal:3000` by default — override with `BIRD_MOCK_SERVICE_URL` if the
-app's `SERVICE_URL`/port differ. You can also run it directly on the host instead:
+app's `SERVICE_URL` or port differs. You can also run it directly on the host instead:
 
 ```bash
 PORT=8081 npx ts-node mock-servers/bird/server.ts
@@ -129,7 +136,7 @@ the simulated callback signature verifies.
 3. Force Bird to fail so Twilio->Bird failover (or vice versa, depending on
    `SMS_PROVIDER_PRIORITY`) is visible — either point `TWILIO_API_BASE_URL` at a failing target
    for a Twilio-first failure, or send straight to Bird with a forced failure header (the mock
-   only reacts to `X-Mock-Force`, which the app itself does not forward, so to force a *Bird*
+   only reacts to `X-Mock-Force`, which the app itself does not forward, so to force a _Bird_
    failure during a real end-to-end run temporarily set `SMS_PROVIDER_PRIORITY=bird` and hit the
    mock directly to pre-validate the header behavior, or add a short-lived proxy/manual curl
    against the mock to confirm the 503/400/timeout paths shown above).
@@ -138,7 +145,7 @@ the simulated callback signature verifies.
    the mock's `bird-mock-<uuid>` id when Bird was selected.
 6. Trigger the delivery webhook: `curl -X POST http://localhost:8081/simulate-callback/<provider_message_id> -H "Content-Type: application/json" -d '{"status":"delivered"}'`.
 7. Confirm the message transitions to `DELIVERED` in the database (same query as the Twilio
-   walkthrough above, `WHERE idempotency_key = 'demo-001'`).
+   walkthrough above, `WHERE "idempotencyKey" = 'demo-001'`).
 
 ### Status
 
