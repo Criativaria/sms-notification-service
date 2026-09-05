@@ -1,7 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 
 import { PrismaService } from '../../database/prisma.service';
-import { retentionMetrics } from './retention.metrics';
 import { RetentionService } from './retention.service';
 
 interface TxMocks {
@@ -48,10 +47,6 @@ function buildService(mocks: Mocks): RetentionService {
 }
 
 describe('RetentionService', () => {
-  beforeEach(() => {
-    retentionMetrics.retentionDeletedTotal = 0;
-  });
-
   it('registers a durable BullMQ scheduler with the configured interval', async () => {
     const mocks = buildMocks();
     mocks.config.get.mockImplementation((key: string) =>
@@ -113,21 +108,6 @@ describe('RetentionService', () => {
     expect(outboxOrder).toBeLessThan(messageOrder);
   });
 
-  it('increments the retention metric by the deleted count', async () => {
-    const mocks = buildMocks();
-    mocks.tx.smsMessage.findMany.mockResolvedValue([
-      { id: 'msg-1' },
-      { id: 'msg-2' },
-      { id: 'msg-3' },
-    ]);
-    mocks.tx.smsMessage.deleteMany.mockResolvedValue({ count: 3 });
-    const service = buildService(mocks);
-
-    await service.purgeExpired();
-
-    expect(retentionMetrics.retentionDeletedTotal).toBe(3);
-  });
-
   it('deletes nothing and reports zero when no messages are expired', async () => {
     const mocks = buildMocks();
     const service = buildService(mocks);
@@ -139,7 +119,6 @@ describe('RetentionService', () => {
     expect(mocks.tx.smsAttempt.deleteMany).not.toHaveBeenCalled();
     expect(mocks.tx.outboxEvent.deleteMany).not.toHaveBeenCalled();
     expect(mocks.tx.smsMessage.deleteMany).not.toHaveBeenCalled();
-    expect(retentionMetrics.retentionDeletedTotal).toBe(0);
   });
 
   it('honors a configured batch size when selecting a batch', async () => {

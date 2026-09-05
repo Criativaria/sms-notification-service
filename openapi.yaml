@@ -5,10 +5,10 @@ info:
   description: |
     NestJS microservice that accepts SMS send requests, dispatches them through a
     provider-priority chain (Twilio, Bird), tracks delivery lifecycle via provider
-    webhooks, and exposes operational endpoints for dead-letter recovery and metrics.
+    webhooks, and exposes an operational endpoint for dead-letter recovery.
 
     ## Private-network endpoints
-    Routes under `/api/v1/sms`, `/internal/dlq`, and `/internal/metrics` are guarded by
+    Routes under `/api/v1/sms` and `/internal/dlq` are guarded by
     `PrivateNetworkGuard`, which only allows callers whose source IP falls inside
     `PRIVATE_NETWORK_CIDRS`. The shipped `.env.example` default
     (`127.0.0.1/32,::1/128`) includes IPv4 and IPv6 loopback, so testing these routes
@@ -40,7 +40,7 @@ tags:
   - name: DLQ
     description: Dead-letter-queue operational recovery.
   - name: Operations
-    description: Health and metrics endpoints.
+    description: Health endpoints.
 
 paths:
   /api/v1/sms/send:
@@ -278,30 +278,6 @@ paths:
                 example:
                   status: ok
 
-  /internal/metrics:
-    get:
-      tags: [Operations]
-      summary: Operational metrics snapshot
-      description: |
-        Returns in-memory counters and live queue/outbox gauges. Counters reset on
-        process restart; gauges are read live from BullMQ and the outbox table.
-      operationId: getMetrics
-      security:
-        - privateNetwork: []
-      responses:
-        '200':
-          description: Metrics snapshot.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetricsSnapshot'
-        '403':
-          description: Caller is not within an allowed private-network CIDR.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
 components:
   securitySchemes:
     privateNetwork:
@@ -442,73 +418,6 @@ components:
         status: delivered
         eventId: evt-123
 
-    MetricsSnapshot:
-      type: object
-      required: [gauges, counters]
-      properties:
-        gauges:
-          type: object
-          required: [dispatchQueue, outboxUnpublished, deadLetterQueue]
-          properties:
-            dispatchQueue:
-              $ref: '#/components/schemas/QueueGauges'
-            outboxUnpublished:
-              type: integer
-              example: 0
-            deadLetterQueue:
-              $ref: '#/components/schemas/QueueGauges'
-        counters:
-          type: object
-          required:
-            - providerAttempts
-            - providerErrors
-            - failovers
-            - deadLetters
-            - deadLetterNotifications
-            - processingLatency
-          properties:
-            providerAttempts:
-              type: integer
-              example: 12
-            providerErrors:
-              type: integer
-              example: 1
-            failovers:
-              type: integer
-              example: 0
-            deadLetters:
-              type: integer
-              example: 0
-            deadLetterNotifications:
-              type: integer
-              example: 0
-            processingLatency:
-              type: object
-              required: [count, totalMs, averageMs]
-              properties:
-                count:
-                  type: integer
-                  example: 12
-                totalMs:
-                  type: number
-                  example: 4820
-                averageMs:
-                  type: number
-                  example: 401.6
-
-    QueueGauges:
-      type: object
-      required: [waiting, delayed, active]
-      properties:
-        waiting:
-          type: integer
-          example: 0
-        delayed:
-          type: integer
-          example: 0
-        active:
-          type: integer
-          example: 0
 
     ErrorResponse:
       type: object

@@ -130,9 +130,9 @@ start. Full reference: [`docs/configuration.md`](docs/configuration.md). Grouped
 
 - `SERVICE_URL` — public base URL, used to reconstruct the Twilio callback URL for signature
   verification.
-- `PRIVATE_NETWORK_CIDRS` — comma-separated CIDRs allowed to call `/api/v1/sms/send`,
-  `/internal/dlq/*`, and `/internal/metrics`. The default `127.0.0.1/32,::1/128` means these
-  routes work out of the box against `localhost`/loopback without any extra setup.
+- `PRIVATE_NETWORK_CIDRS` — comma-separated CIDRs allowed to call `/api/v1/sms/send` and
+  `/internal/dlq/*`. The default `127.0.0.1/32,::1/128` means these routes work out of the box
+  against `localhost`/loopback without any extra setup.
 - `ENCRYPTION_KEY` — base64-encoded 32-byte key used to encrypt the SMS body at rest.
 
 **Tuning and limits**
@@ -157,7 +157,6 @@ No global path prefix; base URL in local development is `http://localhost:3000`.
 | `POST` | `/webhooks/twilio`                 | Twilio HMAC-SHA1 signature | Twilio delivery-status callback                  |
 | `POST` | `/webhooks/bird`                   | Bird HMAC-SHA256 signature | Bird delivery-status callback                    |
 | `POST` | `/internal/dlq/:messageId/requeue` | `PrivateNetworkGuard`      | Replay a dead-lettered (`FATAL_FAILURE`) message |
-| `GET`  | `/internal/metrics`                | `PrivateNetworkGuard`      | Queue, outbox, DLQ, and delivery metrics         |
 
 `PrivateNetworkGuard` matches the socket remote address (never `X-Forwarded-For`) against
 `PRIVATE_NETWORK_CIDRS`; a caller outside those CIDRs gets `403 Forbidden`.
@@ -170,8 +169,8 @@ into Insomnia or Postman for interactive exploration.
 
 Import `openapi.yaml` (repo root) into Insomnia — or Postman, or any OpenAPI 3 importer — to get
 every real endpoint pre-configured with example request bodies. The private-network-only routes
-(`/api/v1/sms/send`, `/internal/dlq/:messageId/requeue`, `/internal/metrics`) work against
-`localhost` right after import, since the default `PRIVATE_NETWORK_CIDRS` already allows loopback.
+(`/api/v1/sms/send`, `/internal/dlq/:messageId/requeue`) work against `localhost` right after
+import, since the default `PRIVATE_NETWORK_CIDRS` already allows loopback.
 The two webhook routes (`/webhooks/twilio`, `/webhooks/bird`) will 403 on a bare import-and-send,
 because they require a real HMAC signature; use the Bird mock's `POST /simulate-callback/:messageId`
 flow from [`docs/provider-sandbox.md`](docs/provider-sandbox.md) instead to trigger a genuinely
@@ -205,14 +204,23 @@ pointed at the bundled mock, or real Twilio/Bird credentials if you've set them)
 
 1. **Send a message.**
 
+   > On a real Twilio trial account, `to` must be a
+   > [verified Caller ID](https://console.twilio.com/us1/develop/phone-numbers/manage/verified)
+   > you've added to the account (otherwise Twilio returns error
+   > [572002](https://www.twilio.com/docs/errors/572002) — replace `+15551234567` below with your
+   > own verified number), and `message` must match one of the approved sample-message categories
+   > registered for the sending number — arbitrary free text is rejected while the number's use
+   > case is pending verification. `sms_appointment_reminders` is the category approved for this
+   > project's number.
+
    ```bash
    curl -X POST http://localhost:3000/api/v1/sms/send \
      -H "Content-Type: application/json" \
-     -H "X-Idempotency-Key: demo-001" \
+     -H "X-Idempotency-Key: teste-016" \
      -d '{
        "to": "+15551234567",
-       "message": "Your verification code is 123456",
-       "metadata": { "template": "otp" }
+       "message": "sms_appointment_reminders",
+       "metadata": { "origem": "manual" }
      }'
    ```
 
@@ -222,9 +230,9 @@ pointed at the bundled mock, or real Twilio/Bird credentials if you've set them)
    {
      "status": "success",
      "data": {
-       "messageId": "b3f1e5a2-7c94-4d1e-8f2a-1c2d3e4f5a6b",
+       "messageId": "8c161082-a14e-44c3-8584-a8c5d71d383a",
        "status": "QUEUED",
-       "createdAt": "2026-09-04T12:34:56.789Z"
+       "createdAt": "2026-09-05T02:27:29.004Z"
      }
    }
    ```
@@ -287,7 +295,7 @@ src/
     webhooks/      # Signed Twilio/Bird delivery-status callbacks
     maintenance/   # Retention purge, stale-processing recovery, ambiguous-outcome expiry
   database/        # Prisma repositories and the SMS lifecycle state machine
-  observability/    # Structured logging config and the metrics endpoint
+  observability/    # Structured logging config
   config/          # Startup environment validation
 mock-servers/bird/  # Local mock of Bird's Messages API for demo/dev use
 ```

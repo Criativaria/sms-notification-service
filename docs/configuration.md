@@ -12,7 +12,7 @@ bad configuration reports **every** problem at once and the process refuses to s
 | `NODE_ENV` | No | `development` | One of `development`, `test`, `production`. |
 | `PORT` | No | `3000` | HTTP listen port. Must be a valid port number. |
 | `SERVICE_URL` | Yes | — | Public base URL (`http`/`https`). Used to reconstruct the Twilio callback URL for signature verification. |
-| `PRIVATE_NETWORK_CIDRS` | Yes | — | Comma-separated CIDRs allowed to call private routes including `/api/v1/sms/send`, `/internal/dlq/*`, and `/internal/metrics`. Matched against the socket remote address. |
+| `PRIVATE_NETWORK_CIDRS` | Yes | — | Comma-separated CIDRs allowed to call private routes including `/api/v1/sms/send` and `/internal/dlq/*`. Matched against the socket remote address. |
 | `DATABASE_URL` | Yes | — | PostgreSQL connection string (`postgres`/`postgresql` scheme). |
 | `REDIS_URL` | Yes | — | Redis connection string (`redis`/`rediss` scheme). Backs BullMQ. |
 | `SMS_PROVIDER_PRIORITY` | Yes | — | Comma-separated provider order. Values must be unique and drawn from `twilio`, `bird` (e.g. `twilio,bird`). Determines failover order and which credentials are required. |

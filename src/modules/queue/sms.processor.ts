@@ -18,7 +18,6 @@ import {
   SmsDispatchJobData,
 } from './queue.constants';
 import { ProviderRateLimiter } from './provider-rate-limiter';
-import { MetricsService } from '../../observability/metrics.service';
 
 export type ProcessOutcome =
   | { status: 'skipped' }
@@ -71,7 +70,6 @@ export class SmsProcessor extends WorkerHost {
     private readonly encryption: EncryptionService,
     private readonly prisma: PrismaService,
     private readonly providerRateLimiter: ProviderRateLimiter,
-    private readonly metrics: MetricsService,
     configService: ConfigService,
   ) {
     super();
@@ -84,12 +82,7 @@ export class SmsProcessor extends WorkerHost {
   }
 
   async process(job: Job<SmsDispatchJobData>): Promise<ProcessOutcome> {
-    const startedAt = Date.now();
-    try {
-      return await this.processDispatch(job);
-    } finally {
-      this.metrics.recordProcessingLatency(Date.now() - startedAt);
-    }
+    return this.processDispatch(job);
   }
 
   private async processDispatch(job: Job<SmsDispatchJobData>): Promise<ProcessOutcome> {
@@ -128,7 +121,6 @@ export class SmsProcessor extends WorkerHost {
       }
 
       await this.providerRateLimiter.acquire(provider.providerName);
-      this.metrics.recordProviderAttempt();
       const result = await provider.sendSms({
         to: row.recipientPhone,
         body,
@@ -145,7 +137,6 @@ export class SmsProcessor extends WorkerHost {
       }
 
       const { isAmbiguous, isRetryable, errorMessage } = classify(result);
-      this.metrics.recordProviderError();
 
       await this.lifecycle.finalizeProviderAttempt(messageId, reservation.attemptId, {
         outcome: 'FAILED',
@@ -166,7 +157,6 @@ export class SmsProcessor extends WorkerHost {
         `PROVIDER_ATTEMPT_FAILED messageId=${messageId} provider=${provider.providerName} retryable=${isRetryable}`,
       );
       if (providers.indexOf(provider) < providers.length - 1) {
-        this.metrics.recordFailover();
         this.logger.warn(`PROVIDER_FAILOVER messageId=${messageId} from=${provider.providerName}`);
       }
       passFailures.push({ providerName: provider.providerName, isRetryable });
@@ -194,7 +184,6 @@ export class SmsProcessor extends WorkerHost {
       }
 
       await this.lifecycle.markFatalFailure(messageId, summary);
-      this.metrics.recordDeadLetter();
       this.logger.warn(`MESSAGE_DEAD_LETTERED messageId=${messageId} reason=${summary}`);
       return {
         status: 'dead-letter',

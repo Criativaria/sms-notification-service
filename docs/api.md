@@ -10,17 +10,10 @@ development is `http://localhost:3000`.
 | `POST` | `/webhooks/twilio`                 | Twilio delivery-status callback | Public (signature-verified) |
 | `POST` | `/webhooks/bird`                   | Bird delivery-status callback   | Public (signature-verified) |
 | `POST` | `/internal/dlq/:messageId/requeue` | Replay a dead-lettered message  | Private-network only        |
-| `GET`  | `/internal/metrics`                 | Queue and delivery metrics      | Private-network only        |
 
 Private-network routes are gated by `PrivateNetworkGuard`, which matches the socket remote
 address (never `X-Forwarded-For`) against `PRIVATE_NETWORK_CIDRS`. A caller outside those
 CIDRs receives `403 Forbidden`.
-
-## GET /internal/metrics
-
-Returns live queue/outbox/DLQ gauges and process-lifetime counters for provider attempts,
-provider errors, failovers, dead letters, and dispatch processing latency. It contains no message
-content or recipient data. Counters reset when the service process restarts.
 
 ---
 

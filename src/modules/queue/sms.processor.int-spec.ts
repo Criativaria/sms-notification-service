@@ -11,7 +11,6 @@ import { PrismaClient } from '../../generated/prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { SmsLifecycleRepository } from '../../database/sms-lifecycle.repository';
 import { SmsPersistenceRepository } from '../../database/sms-persistence.repository';
-import { MetricsService } from '../../observability/metrics.service';
 import { ProviderFactory } from '../providers/provider.factory';
 import { ISmsProvider, SendSmsResult } from '../providers/interfaces/sms-provider.interface';
 import { DlqController } from './dlq.controller';
@@ -30,14 +29,6 @@ import {
 const unlimitedRateLimiter = {
   acquire: jest.fn().mockResolvedValue(undefined),
 } as unknown as ProviderRateLimiter;
-
-const metrics = {
-  recordProviderAttempt: jest.fn(),
-  recordProviderError: jest.fn(),
-  recordFailover: jest.fn(),
-  recordDeadLetter: jest.fn(),
-  recordProcessingLatency: jest.fn(),
-} as unknown as MetricsService;
 
 /**
  * Integration coverage for the reliable-delivery pipeline against LIVE Redis (BullMQ) and
@@ -195,7 +186,6 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         encryption,
         prisma,
         unlimitedRateLimiter,
-        metrics,
         defaultConfig(),
       );
 
@@ -257,7 +247,6 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         encryption,
         prisma,
         unlimitedRateLimiter,
-        metrics,
         defaultConfig(),
       );
 
@@ -303,7 +292,6 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         encryption,
         prisma,
         unlimitedRateLimiter,
-        metrics,
         defaultConfig(),
       );
 
@@ -395,8 +383,7 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
       const deadLetterEvent = await client.outboxEvent.findFirstOrThrow({
         where: { aggregateId: messageId, eventType: 'SMS_DEAD_LETTERED' },
       });
-      const notificationMetrics = { recordDeadLetterNotification: jest.fn() };
-      const processor = new DlqProcessor(notificationMetrics as unknown as MetricsService);
+      const processor = new DlqProcessor();
       const events = new QueueEvents(SMS_DLQ_QUEUE, { connection: { url: process.env.REDIS_URL } });
       const worker = new Worker<SmsDispatchJobData>(
         SMS_DLQ_QUEUE,
@@ -411,7 +398,6 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         const notification = await deadLetterQueue.getJob(dlqJobId);
         await notification?.waitUntilFinished(events);
 
-        expect(notificationMetrics.recordDeadLetterNotification).toHaveBeenCalled();
         expect(await deadLetterQueue.getJob(dlqJobId)).toBeUndefined();
         expect(
           (await client.smsMessage.findUniqueOrThrow({ where: { id: messageId } })).status,

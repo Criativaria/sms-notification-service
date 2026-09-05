@@ -6,7 +6,6 @@ import { Queue } from 'bullmq';
 import type { SmsMessageStatus } from '../../generated/prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { RETENTION_CLEANUP_JOB, SMS_MAINTENANCE_QUEUE } from '../queue/queue.constants';
-import { incrementRetentionDeleted } from './retention.metrics';
 
 /**
  * Terminal statuses whose records are safe to purge once retention has elapsed.
@@ -74,7 +73,7 @@ export class RetentionService implements OnModuleInit {
    * inside a transaction to satisfy the `onDelete: Restrict` foreign keys.
    *
    * Emits a structured `RETENTION_CLEANUP` audit log line (deleted count only — never phone
-   * numbers or message bodies) and increments the in-module retention counter.
+   * numbers or message bodies).
    *
    * @param now Injectable clock for deterministic testing; defaults to the current time.
    * @returns The number of `sms_messages` rows deleted in this run.
@@ -106,7 +105,6 @@ export class RetentionService implements OnModuleInit {
       return deleted.count;
     });
 
-    incrementRetentionDeleted(deletedMessages);
     this.logger.log(`RETENTION_CLEANUP deletedMessages=${deletedMessages}`);
 
     return { deletedMessages };

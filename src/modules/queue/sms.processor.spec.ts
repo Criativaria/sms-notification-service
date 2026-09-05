@@ -13,7 +13,6 @@ import { ISmsProvider, SendSmsResult } from '../providers/interfaces/sms-provide
 import { SmsProcessor } from './sms.processor';
 import { ProviderRateLimiter } from './provider-rate-limiter';
 import { SmsDispatchJobData } from './queue.constants';
-import { MetricsService } from '../../observability/metrics.service';
 
 const MESSAGE_ID = 'msg-1';
 
@@ -44,13 +43,6 @@ interface Mocks {
   encryption: { decrypt: jest.Mock };
   prisma: { smsMessage: { findUnique: jest.Mock } };
   providerRateLimiter: { acquire: jest.Mock };
-  metrics: {
-    recordProviderAttempt: jest.Mock;
-    recordProviderError: jest.Mock;
-    recordFailover: jest.Mock;
-    recordDeadLetter: jest.Mock;
-    recordProcessingLatency: jest.Mock;
-  };
 }
 
 interface StubProvider {
@@ -100,13 +92,6 @@ function buildMocks(stubs: StubProvider[] = [stubProvider('twilio')]): Mocks {
       },
     },
     providerRateLimiter: { acquire: jest.fn().mockResolvedValue(undefined) },
-    metrics: {
-      recordProviderAttempt: jest.fn(),
-      recordProviderError: jest.fn(),
-      recordFailover: jest.fn(),
-      recordDeadLetter: jest.fn(),
-      recordProcessingLatency: jest.fn(),
-    },
   };
 }
 
@@ -117,7 +102,6 @@ function buildProcessor(mocks: Mocks, config: Record<string, unknown> = {}): Sms
     mocks.encryption as unknown as EncryptionService,
     mocks.prisma as unknown as PrismaService,
     mocks.providerRateLimiter as unknown as ProviderRateLimiter,
-    mocks.metrics as unknown as MetricsService,
     new ConfigService({ PROVIDER_MAX_RETRY_ROUNDS: 3, ...config }),
   );
 }
@@ -147,8 +131,6 @@ describe('SmsProcessor', () => {
       outcome: 'ACCEPTED',
       providerMessageId: 'twilio-message-1',
     });
-    expect(mocks.metrics.recordProviderAttempt).toHaveBeenCalledTimes(1);
-    expect(mocks.metrics.recordProcessingLatency).toHaveBeenCalledWith(expect.any(Number));
   });
 
   it('invokes the provider once when a duplicate or restarted job replays after reservation', async () => {

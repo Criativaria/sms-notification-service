@@ -3,8 +3,6 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 
 import { CryptoModule } from '../../common/crypto/crypto.module';
-import { MetricsController } from '../../observability/metrics.controller';
-import { MetricsService } from '../../observability/metrics.service';
 import { ProvidersModule } from '../providers/providers.module';
 import { DlqController } from './dlq.controller';
 import { DlqProcessor } from './dlq.processor';
@@ -38,8 +36,8 @@ import { SMS_DISPATCH_QUEUE, SMS_DLQ_QUEUE, SMS_MAINTENANCE_QUEUE } from './queu
     ProvidersModule,
     CryptoModule,
   ],
-  controllers: [DlqController, MetricsController],
-  providers: [OutboxRelayService, ProviderRateLimiter, SmsProcessor, DlqProcessor, MetricsService],
+  controllers: [DlqController],
+  providers: [OutboxRelayService, ProviderRateLimiter, SmsProcessor, DlqProcessor],
   exports: [BullModule],
 })
 export class QueueModule {}
