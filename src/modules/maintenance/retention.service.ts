@@ -1,8 +1,11 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Queue } from 'bullmq';
 
 import type { SmsMessageStatus } from '../../generated/prisma/client';
 import { PrismaService } from '../../database/prisma.service';
+import { RETENTION_CLEANUP_JOB, SMS_MAINTENANCE_QUEUE } from '../queue/queue.constants';
 import { incrementRetentionDeleted } from './retention.metrics';
 
 /**
@@ -35,21 +38,17 @@ const DEFAULT_CLEANUP_BATCH_SIZE = 500;
  * `prisma.$transaction` (idempotency keys cascade automatically). Work is done in batches
  * to stay safe on large tables.
  *
- * `@nestjs/schedule` is intentionally not a dependency, so the loop is a plain
- * `setInterval` started in `onModuleInit` and cleared in `onModuleDestroy`, guarded by an
- * in-flight flag so a slow purge cannot stack up behind the interval.
  */
 @Injectable()
-export class RetentionService implements OnModuleInit, OnModuleDestroy {
+export class RetentionService implements OnModuleInit {
   private readonly logger = new Logger(RetentionService.name);
   private readonly intervalMs: number;
   private readonly batchSize: number;
-  private timer: NodeJS.Timeout | null = null;
-  private running = false;
 
   constructor(
     private readonly prisma: PrismaService,
     configService: ConfigService,
+    @InjectQueue(SMS_MAINTENANCE_QUEUE) private readonly maintenanceQueue: Queue,
   ) {
     this.intervalMs = readPositiveInt(
       configService.get('RETENTION_CLEANUP_INTERVAL_MS'),
@@ -61,38 +60,12 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
     );
   }
 
-  onModuleInit(): void {
-    this.timer = setInterval(() => {
-      void this.tick();
-    }, this.intervalMs);
-    // Do not keep the event loop alive solely for the cleanup timer.
-    this.timer.unref?.();
-  }
-
-  onModuleDestroy(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
-  }
-
-  /**
-   * One scheduled purge cycle. Guarded against overlapping runs so a slow purge on a large
-   * table cannot stack up behind the interval, and failures are logged without crashing the
-   * timer.
-   */
-  async tick(): Promise<void> {
-    if (this.running) {
-      return;
-    }
-    this.running = true;
-    try {
-      await this.purgeExpired();
-    } catch (error) {
-      this.logger.error(`RETENTION_CLEANUP_FAILED ${describeError(error)}`);
-    } finally {
-      this.running = false;
-    }
+  async onModuleInit(): Promise<void> {
+    await this.maintenanceQueue.upsertJobScheduler(
+      RETENTION_CLEANUP_JOB,
+      { every: this.intervalMs },
+      { name: RETENTION_CLEANUP_JOB, data: {} },
+    );
   }
 
   /**
@@ -122,8 +95,9 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
         return 0;
       }
 
-      // Children first: both carry onDelete: Restrict foreign keys to sms_messages, so the
+      // Children first: all carry onDelete: Restrict foreign keys to sms_messages, so the
       // message rows cannot be removed while these reference them.
+      await tx.smsAttemptResolution.deleteMany({ where: { smsMessageId: { in: ids } } });
       await tx.smsAttempt.deleteMany({ where: { smsMessageId: { in: ids } } });
       await tx.outboxEvent.deleteMany({ where: { aggregateId: { in: ids } } });
 
@@ -142,8 +116,4 @@ export class RetentionService implements OnModuleInit, OnModuleDestroy {
 function readPositiveInt(raw: unknown, fallback: number): number {
   const parsed = typeof raw === 'number' ? raw : Number(raw);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

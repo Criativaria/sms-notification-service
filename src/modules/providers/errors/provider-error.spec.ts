@@ -79,4 +79,24 @@ describe('normalizeProviderError', () => {
     expect(normalized.isRetryable).toBe(false);
     expect(normalized.message).toContain('[unknown]');
   });
+
+  it('classifies a Twilio SDK RestException (HTTP response shape) the same as an axios HTTP error', () => {
+    class RestException extends Error {
+      status: number;
+      constructor(status: number) {
+        super(`[HTTP ${status}] Failed to execute request`);
+        this.status = status;
+      }
+    }
+
+    const rateLimited = normalizeProviderError(new RestException(429), 'twilio');
+    expect(rateLimited.kind).toBe('http');
+    expect(rateLimited.isRetryable).toBe(true);
+    expect(rateLimited.httpStatus).toBe(429);
+
+    const badRequest = normalizeProviderError(new RestException(400), 'twilio');
+    expect(badRequest.kind).toBe('http');
+    expect(badRequest.isRetryable).toBe(false);
+    expect(badRequest.httpStatus).toBe(400);
+  });
 });

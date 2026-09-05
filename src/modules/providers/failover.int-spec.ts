@@ -10,13 +10,31 @@ import { BirdProvider } from './strategies/bird.provider';
 import { TwilioProvider } from './strategies/twilio.provider';
 
 /**
+ * Mocks the shape of the Twilio SDK's REST error, thrown by `client.messages.create` for
+ * a non-2xx response (see `node_modules/twilio/lib/base/RestException.js`): a plain `Error`
+ * subclass carrying the HTTP status as `.status`, not `.response.status` like axios.
+ */
+class FakeTwilioRestException extends Error {
+  status: number;
+  constructor(status: number) {
+    super(`[HTTP ${status}] Failed to execute request`);
+    this.status = status;
+  }
+}
+
+const twilioMessagesCreate = jest.fn();
+
+jest.mock('twilio', () => jest.fn(() => ({ messages: { create: twilioMessagesCreate } })));
+
+/**
  * Integration coverage for the automatic Twilio-to-Bird failover invariant.
  *
  * This assembles the REAL provider stack — {@link ProviderManager} over the real
  * {@link ProviderFactory}, driven by the configured `SMS_PROVIDER_PRIORITY=twilio,bird`,
  * with real {@link TwilioProvider} and {@link BirdProvider} strategies — and only stubs
- * the lowest seam, the axios HttpService. It therefore exercises the true HTTP-status →
- * retryability classification (via `normalizeProviderError`) end to end, not hand-rolled
+ * the lowest seam each strategy talks to: the Twilio SDK's `messages.create` call for
+ * Twilio, and the axios `HttpService` for Bird. It therefore exercises the true HTTP-status
+ * → retryability classification (via `normalizeProviderError`) end to end, not hand-rolled
  * `SendSmsResult` stubs.
  *
  * Strategy (a) from the brief was chosen over the worker-level strategy (b) because the
@@ -34,7 +52,6 @@ describe('Provider failover (integration, real provider stack, stubbed HTTP laye
   };
 
   let configService: ConfigService;
-  let twilioHttp: { post: jest.Mock };
   let birdHttp: { post: jest.Mock };
   let manager: ProviderManager;
 
@@ -60,10 +77,10 @@ describe('Provider failover (integration, real provider stack, stubbed HTTP laye
     // integration setup file populates (SMS_PROVIDER_PRIORITY, provider credentials).
     configService = new ConfigService();
 
-    twilioHttp = { post: jest.fn() };
+    twilioMessagesCreate.mockReset();
     birdHttp = { post: jest.fn() };
 
-    const twilio = new TwilioProvider(twilioHttp as unknown as HttpService, configService);
+    const twilio = new TwilioProvider(configService);
     const bird = new BirdProvider(birdHttp as unknown as HttpService, configService);
 
     const factory = new ProviderFactory(configService, [twilio, bird]);
@@ -77,7 +94,7 @@ describe('Provider failover (integration, real provider stack, stubbed HTTP laye
 
   it('fails over to Bird after a retryable Twilio failure and returns Bird as the sender', async () => {
     // Twilio: HTTP 503 (retryable server error). Bird: success with a provider message id.
-    twilioHttp.post.mockReturnValue(httpStatusError(503));
+    twilioMessagesCreate.mockRejectedValue(new FakeTwilioRestException(503));
     birdHttp.post.mockReturnValue(httpSuccess({ id: 'bird-provider-msg-id' }));
 
     const outcome = await manager.dispatch(options);
@@ -88,7 +105,7 @@ describe('Provider failover (integration, real provider stack, stubbed HTTP laye
     expect(outcome.result.providerMessageId).toBe('bird-provider-msg-id');
 
     // Twilio was attempted first, then Bird — both attempts are represented, in order.
-    expect(twilioHttp.post).toHaveBeenCalledTimes(1);
+    expect(twilioMessagesCreate).toHaveBeenCalledTimes(1);
     expect(birdHttp.post).toHaveBeenCalledTimes(1);
     expect(outcome.attempts.map((attempt) => attempt.providerName)).toEqual(['twilio', 'bird']);
 
@@ -102,7 +119,7 @@ describe('Provider failover (integration, real provider stack, stubbed HTTP laye
   });
 
   it('fails over on a 429 Twilio rate-limit as well (rate limit is retryable)', async () => {
-    twilioHttp.post.mockReturnValue(httpStatusError(429));
+    twilioMessagesCreate.mockRejectedValue(new FakeTwilioRestException(429));
     birdHttp.post.mockReturnValue(httpSuccess({ id: 'bird-after-429' }));
 
     const outcome = await manager.dispatch(options);
@@ -119,7 +136,7 @@ describe('Provider failover (integration, real provider stack, stubbed HTTP laye
     // outcome must remain PERMANENT (isRetryable === false) so no exponential-backoff round
     // is ever scheduled. Bird here also fails, transiently, to prove the permanent Twilio
     // signal dominates the later retryable one rather than being overwritten by it.
-    twilioHttp.post.mockReturnValue(httpStatusError(400));
+    twilioMessagesCreate.mockRejectedValue(new FakeTwilioRestException(400));
     birdHttp.post.mockReturnValue(httpStatusError(503));
 
     const outcome = await manager.dispatch(options);

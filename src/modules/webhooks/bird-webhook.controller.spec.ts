@@ -30,11 +30,23 @@ function createController(result?: ApplyDeliveryReportResult) {
   const applyDeliveryReport = jest.fn(() => Promise.resolve(result));
   const lifecycle = { applyDeliveryReport } as unknown as SmsLifecycleRepository;
   const configService = {
+    get: () => SIGNING_KEY,
     getOrThrow: () => SIGNING_KEY,
   } as unknown as ConfigService;
 
   const controller = new BirdWebhookController(configService, new WebhooksService(lifecycle));
   return { controller, applyDeliveryReport };
+}
+
+function createUnconfiguredController() {
+  const applyDeliveryReport = jest.fn();
+  const lifecycle = { applyDeliveryReport } as unknown as SmsLifecycleRepository;
+  const configService = {
+    get: () => undefined,
+    getOrThrow: () => SIGNING_KEY,
+  } as unknown as ConfigService;
+
+  return new BirdWebhookController(configService, new WebhooksService(lifecycle));
 }
 
 describe('BirdWebhookController', () => {
@@ -116,5 +128,12 @@ describe('BirdWebhookController', () => {
     await expect(
       controller.handle({ rawBody } as RawBodyRequest<Request>, signature),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('returns 404 when Bird is not configured on this deployment', async () => {
+    const controller = createUnconfiguredController();
+    const { request, signature } = buildRequest({ id: 'bird-1', status: 'delivered' });
+
+    await expect(controller.handle(request, signature)).rejects.toBeInstanceOf(NotFoundException);
   });
 });

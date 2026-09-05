@@ -1,6 +1,11 @@
 import { Module } from '@nestjs/common';
 
+import { QueueModule } from '../queue/queue.module';
+import { RetentionProcessor } from './retention.processor';
 import { RetentionService } from './retention.service';
+import { ProcessingRecoveryProcessor } from './processing-recovery.processor';
+import { ProcessingRecoveryService } from './processing-recovery.service';
+import { AmbiguousOutcomeExpiryProcessor } from './ambiguous-outcome-expiry.processor';
 
 /**
  * Maintenance module: background housekeeping jobs. Currently hosts the 90-day data
@@ -12,7 +17,14 @@ import { RetentionService } from './retention.service';
  * by the app module, so `ConfigService` is likewise injectable without a local import.
  */
 @Module({
-  providers: [RetentionService],
+  imports: [QueueModule],
+  providers: [
+    RetentionService,
+    RetentionProcessor,
+    ProcessingRecoveryService,
+    ProcessingRecoveryProcessor,
+    AmbiguousOutcomeExpiryProcessor,
+  ],
   exports: [RetentionService],
 })
 export class MaintenanceModule {}

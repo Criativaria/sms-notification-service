@@ -8,7 +8,12 @@ import { PrismaService } from '../../database/prisma.service';
 import { SmsLifecycleRepository } from '../../database/sms-lifecycle.repository';
 import { SmsPersistenceRepository } from '../../database/sms-persistence.repository';
 import { OutboxRelayService } from './outbox-relay.service';
-import { SMS_DISPATCH_QUEUE, SMS_DLQ_QUEUE, SmsDispatchJobData } from './queue.constants';
+import {
+  SMS_DISPATCH_QUEUE,
+  SMS_DLQ_QUEUE,
+  SMS_MAINTENANCE_QUEUE,
+  SmsDispatchJobData,
+} from './queue.constants';
 
 describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
   let prisma: PrismaService;
@@ -16,6 +21,7 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
   let lifecycle: SmsLifecycleRepository;
   let dispatchQueue: Queue<SmsDispatchJobData>;
   let deadLetterQueue: Queue<SmsDispatchJobData>;
+  let maintenanceQueue: Queue<SmsDispatchJobData>;
   let relay: OutboxRelayService;
   const createdMessageIds: string[] = [];
   const createdJobIds: string[] = [];
@@ -31,7 +37,7 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
     const outboxEvent = await (prisma as unknown as PrismaClient).outboxEvent.findFirstOrThrow({
       where: { aggregateId: result.message.id, eventType: 'SMS_MESSAGE_QUEUED' },
     });
-    createdJobIds.push(outboxEvent.id);
+    createdJobIds.push(`${result.message.id}#${outboxEvent.id}`);
     return result.message.id;
   }
 
@@ -48,9 +54,13 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
     deadLetterQueue = new Queue<SmsDispatchJobData>(SMS_DLQ_QUEUE, {
       connection: { url: process.env.REDIS_URL },
     });
+    maintenanceQueue = new Queue<SmsDispatchJobData>(SMS_MAINTENANCE_QUEUE, {
+      connection: { url: process.env.REDIS_URL },
+    });
     relay = new OutboxRelayService(
       dispatchQueue,
       deadLetterQueue,
+      maintenanceQueue,
       lifecycle,
       new ConfigService({ OUTBOX_RELAY_INTERVAL_MS: 60_000, OUTBOX_RELAY_BATCH_SIZE: 10 }),
     );
@@ -73,6 +83,7 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
   afterAll(async () => {
     await dispatchQueue.close();
     await deadLetterQueue.close();
+    await maintenanceQueue.close();
     await prisma.$disconnect();
   });
 
@@ -87,7 +98,8 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
     const outboxEvents = await client.outboxEvent.findMany({
       where: { aggregateId: messageId },
     });
-    const job = await dispatchQueue.getJob(outboxEvents[0]!.id);
+    const expectedJobId = `${messageId}#${outboxEvents[0]!.id}`;
+    const job = await dispatchQueue.getJob(expectedJobId);
 
     expect(outboxEvents).toHaveLength(1);
     expect(outboxEvents[0]).toMatchObject({
@@ -97,8 +109,16 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
       payload: { messageId },
     });
     expect(add).toHaveBeenCalledTimes(1);
-    expect(add).toHaveBeenCalledWith('dispatch', { messageId }, { jobId: outboxEvents[0]!.id });
-    expect(job?.id).toBe(outboxEvents[0]!.id);
+    expect(add).toHaveBeenCalledWith(
+      'dispatch',
+      { messageId },
+      {
+        jobId: expectedJobId,
+        removeOnComplete: true,
+        removeOnFail: true,
+      },
+    );
+    expect(job?.id).toBe(expectedJobId);
     expect(job?.data).toEqual({ messageId });
     expect(outboxEvents[0]?.publishedAt).toBeInstanceOf(Date);
     expect(outboxEvents[0]?.retryCount).toBe(0);
@@ -126,9 +146,10 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
     const publishedEvent = await client.outboxEvent.findFirstOrThrow({
       where: { aggregateId: messageId },
     });
-    const job = await dispatchQueue.getJob(publishedEvent.id);
+    const expectedJobId = `${messageId}#${publishedEvent.id}`;
+    const job = await dispatchQueue.getJob(expectedJobId);
     expect(add).toHaveBeenCalledTimes(2);
-    expect(job?.id).toBe(publishedEvent.id);
+    expect(job?.id).toBe(expectedJobId);
     expect(job?.data).toEqual({ messageId });
     expect(publishedEvent.publishedAt).toBeInstanceOf(Date);
     expect(publishedEvent.retryCount).toBe(1);
@@ -154,8 +175,9 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
     const outboxEvent = await client.outboxEvent.findFirstOrThrow({
       where: { aggregateId: messageId },
     });
-    expect(await dispatchQueue.getJob(outboxEvent.id)).toMatchObject({
-      id: outboxEvent.id,
+    const expectedJobId = `${messageId}#${outboxEvent.id}`;
+    expect(await dispatchQueue.getJob(expectedJobId)).toMatchObject({
+      id: expectedJobId,
       data: { messageId },
     });
 
@@ -168,7 +190,7 @@ describe('OutboxRelayService (integration, live PostgreSQL and Redis)', () => {
 
     expect(add).toHaveBeenCalledTimes(2);
     expect(markOutboxPublished).toHaveBeenCalledTimes(2);
-    expect(jobs.filter((job) => job.id === publishedEvent.id)).toHaveLength(1);
+    expect(jobs.filter((job) => job.id === expectedJobId)).toHaveLength(1);
     expect(publishedEvent.publishedAt).toBeInstanceOf(Date);
     expect(publishedEvent.retryCount).toBe(1);
     expect(publishedEvent.lastError).toBe('simulated post-enqueue crash');

@@ -22,6 +22,7 @@ function lifecycle(overrides: Partial<LifecycleSmsMessage> = {}): LifecycleSmsMe
 function createPrismaMock() {
   const smsMessage = {
     updateMany: jest.fn<Promise<{ count: number }>, [unknown]>(() => Promise.resolve({ count: 1 })),
+    findMany: jest.fn<Promise<unknown>, [unknown]>(() => Promise.resolve([])),
     findUnique: jest.fn<Promise<unknown>, [unknown]>(() => Promise.resolve(lifecycle())),
     findFirst: jest.fn<Promise<unknown>, [unknown]>(() => Promise.resolve(null)),
   };
@@ -154,6 +155,52 @@ describe('SmsLifecycleRepository', () => {
     });
   });
 
+  describe('recoverStaleProcessing', () => {
+    it('selects stale PROCESSING messages and creates a recovery outbox event only after the guarded update wins', async () => {
+      const mock = createPrismaMock();
+      const cutoff = new Date('2026-09-04T12:00:00.000Z');
+      mock.smsMessage.findMany.mockResolvedValueOnce([{ id: messageId }]);
+      const repository = new SmsLifecycleRepository(mock.prisma);
+
+      const result = await repository.recoverStaleProcessing(cutoff, 25);
+
+      expect(result).toEqual({ recovered: 1 });
+      expect(mock.smsMessage.findMany).toHaveBeenCalledWith({
+        where: { status: 'PROCESSING', updatedAt: { lt: cutoff } },
+        orderBy: { updatedAt: 'asc' },
+        select: { id: true },
+        take: 25,
+      });
+      expect(mock.smsMessage.updateMany).toHaveBeenCalledWith({
+        where: { id: messageId, status: 'PROCESSING', updatedAt: { lt: cutoff } },
+        data: { status: 'RETRY_SCHEDULED' },
+      });
+      expect(mock.outboxEvent.create).toHaveBeenCalledWith({
+        data: {
+          aggregateType: 'SMS_MESSAGE',
+          aggregateId: messageId,
+          eventType: 'SMS_PROCESSING_RECOVERED',
+          payload: { messageId },
+        },
+      });
+    });
+
+    it('does not create an outbox event when another worker advances the stale row first', async () => {
+      const mock = createPrismaMock();
+      mock.smsMessage.findMany.mockResolvedValueOnce([{ id: messageId }]);
+      mock.smsMessage.updateMany.mockResolvedValueOnce({ count: 0 });
+      const repository = new SmsLifecycleRepository(mock.prisma);
+
+      const result = await repository.recoverStaleProcessing(
+        new Date('2026-09-04T12:00:00.000Z'),
+        25,
+      );
+
+      expect(result).toEqual({ recovered: 0 });
+      expect(mock.outboxEvent.create).not.toHaveBeenCalled();
+    });
+  });
+
   describe('reserveProviderAttempt', () => {
     it('atomically reserves a provider attempt and moves PROCESSING out of dispatchability', async () => {
       const mock = createPrismaMock();
@@ -264,7 +311,7 @@ describe('SmsLifecycleRepository', () => {
       });
     });
 
-    it('leaves an ambiguous failure parked in AWAITING_PROVIDER_RESULT (no status update)', async () => {
+    it('atomically schedules expiry for an ambiguous failure parked in AWAITING_PROVIDER_RESULT', async () => {
       const mock = createPrismaMock();
       mock.smsAttempt.updateMany.mockResolvedValueOnce({ count: 1 });
       const repository = new SmsLifecycleRepository(mock.prisma);
@@ -274,6 +321,7 @@ describe('SmsLifecycleRepository', () => {
         isAmbiguous: true,
         isRetryable: true,
         errorMessage: '[timeout] twilio request timed out',
+        ambiguousOutcomeExpiryMs: 900_000,
       });
 
       expect(mock.smsAttempt.updateMany).toHaveBeenCalledWith({
@@ -286,6 +334,42 @@ describe('SmsLifecycleRepository', () => {
         },
       });
       expect(mock.smsMessage.updateMany).not.toHaveBeenCalled();
+      expect(mock.outboxEvent.create).toHaveBeenCalledWith({
+        data: {
+          aggregateType: 'SMS_MESSAGE',
+          aggregateId: messageId,
+          eventType: 'SMS_AMBIGUOUS_OUTCOME_EXPIRY_SCHEDULED',
+          payload: { messageId, delayMs: 900_000 },
+        },
+      });
+    });
+  });
+
+  describe('expireAmbiguousOutcome', () => {
+    it('moves only a still-awaiting message to UNDELIVERED with an auditable reason', async () => {
+      const mock = createPrismaMock();
+      mock.smsMessage.updateMany.mockResolvedValueOnce({ count: 1 });
+      const repository = new SmsLifecycleRepository(mock.prisma);
+
+      await expect(repository.expireAmbiguousOutcome(messageId)).resolves.toEqual({
+        outcome: 'expired',
+      });
+
+      expect(mock.smsMessage.updateMany).toHaveBeenCalledWith({
+        where: { id: messageId, status: 'AWAITING_PROVIDER_RESULT' },
+        data: { status: 'UNDELIVERED', lastError: 'AMBIGUOUS_OUTCOME_EXPIRED' },
+      });
+      expect(mock.outboxEvent.create).not.toHaveBeenCalled();
+    });
+
+    it('does not overwrite a delivery status set by a webhook before expiry', async () => {
+      const mock = createPrismaMock();
+      mock.smsMessage.updateMany.mockResolvedValueOnce({ count: 0 });
+      const repository = new SmsLifecycleRepository(mock.prisma);
+
+      await expect(repository.expireAmbiguousOutcome(messageId)).resolves.toEqual({
+        outcome: 'not_awaiting_provider_result',
+      });
     });
   });
 

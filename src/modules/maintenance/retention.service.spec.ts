@@ -6,6 +6,7 @@ import { RetentionService } from './retention.service';
 
 interface TxMocks {
   smsMessage: { findMany: jest.Mock; deleteMany: jest.Mock };
+  smsAttemptResolution: { deleteMany: jest.Mock };
   smsAttempt: { deleteMany: jest.Mock };
   outboxEvent: { deleteMany: jest.Mock };
 }
@@ -14,6 +15,7 @@ interface Mocks {
   tx: TxMocks;
   prisma: { $transaction: jest.Mock };
   config: { get: jest.Mock };
+  queue: { upsertJobScheduler: jest.Mock };
 }
 
 function buildMocks(): Mocks {
@@ -22,6 +24,7 @@ function buildMocks(): Mocks {
       findMany: jest.fn().mockResolvedValue([]),
       deleteMany: jest.fn().mockResolvedValue({ count: 0 }),
     },
+    smsAttemptResolution: { deleteMany: jest.fn().mockResolvedValue({ count: 0 }) },
     smsAttempt: { deleteMany: jest.fn().mockResolvedValue({ count: 0 }) },
     outboxEvent: { deleteMany: jest.fn().mockResolvedValue({ count: 0 }) },
   };
@@ -32,6 +35,7 @@ function buildMocks(): Mocks {
     // interactive-transaction contract.
     prisma: { $transaction: jest.fn((cb: (t: TxMocks) => unknown) => cb(tx)) },
     config: { get: jest.fn().mockReturnValue(undefined) },
+    queue: { upsertJobScheduler: jest.fn().mockResolvedValue(undefined) },
   };
 }
 
@@ -39,12 +43,29 @@ function buildService(mocks: Mocks): RetentionService {
   return new RetentionService(
     mocks.prisma as unknown as PrismaService,
     mocks.config as unknown as ConfigService,
+    mocks.queue as never,
   );
 }
 
 describe('RetentionService', () => {
   beforeEach(() => {
     retentionMetrics.retentionDeletedTotal = 0;
+  });
+
+  it('registers a durable BullMQ scheduler with the configured interval', async () => {
+    const mocks = buildMocks();
+    mocks.config.get.mockImplementation((key: string) =>
+      key === 'RETENTION_CLEANUP_INTERVAL_MS' ? 30_000 : undefined,
+    );
+    const service = buildService(mocks);
+
+    await service.onModuleInit();
+
+    expect(mocks.queue.upsertJobScheduler).toHaveBeenCalledWith(
+      'retention-cleanup',
+      { every: 30_000 },
+      { name: 'retention-cleanup', data: {} },
+    );
   });
 
   it('selects only expired terminal messages, deletes children before messages in a transaction, and returns the count', async () => {
@@ -70,6 +91,9 @@ describe('RetentionService', () => {
     });
 
     // Children deleted before the messages (Restrict FKs), keyed by the selected ids.
+    expect(mocks.tx.smsAttemptResolution.deleteMany).toHaveBeenCalledWith({
+      where: { smsMessageId: { in: ['msg-1', 'msg-2'] } },
+    });
     expect(mocks.tx.smsAttempt.deleteMany).toHaveBeenCalledWith({
       where: { smsMessageId: { in: ['msg-1', 'msg-2'] } },
     });
@@ -80,9 +104,11 @@ describe('RetentionService', () => {
       where: { id: { in: ['msg-1', 'msg-2'] } },
     });
 
+    const resolutionOrder = mocks.tx.smsAttemptResolution.deleteMany.mock.invocationCallOrder[0]!;
     const attemptOrder = mocks.tx.smsAttempt.deleteMany.mock.invocationCallOrder[0]!;
     const outboxOrder = mocks.tx.outboxEvent.deleteMany.mock.invocationCallOrder[0]!;
     const messageOrder = mocks.tx.smsMessage.deleteMany.mock.invocationCallOrder[0]!;
+    expect(resolutionOrder).toBeLessThan(attemptOrder);
     expect(attemptOrder).toBeLessThan(messageOrder);
     expect(outboxOrder).toBeLessThan(messageOrder);
   });
@@ -109,6 +135,7 @@ describe('RetentionService', () => {
     const result = await service.purgeExpired();
 
     expect(result).toEqual({ deletedMessages: 0 });
+    expect(mocks.tx.smsAttemptResolution.deleteMany).not.toHaveBeenCalled();
     expect(mocks.tx.smsAttempt.deleteMany).not.toHaveBeenCalled();
     expect(mocks.tx.outboxEvent.deleteMany).not.toHaveBeenCalled();
     expect(mocks.tx.smsMessage.deleteMany).not.toHaveBeenCalled();

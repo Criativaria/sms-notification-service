@@ -1,7 +1,4 @@
-import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
-import { AxiosError, AxiosHeaders, type AxiosResponse } from 'axios';
-import { of, throwError } from 'rxjs';
 
 import { SendSmsOptions } from '../interfaces/sms-provider.interface';
 import { TwilioProvider } from './twilio.provider';
@@ -25,49 +22,53 @@ function createConfigService(): ConfigService {
   } as unknown as ConfigService;
 }
 
-function okResponse<T>(data: T): AxiosResponse<T> {
-  return {
-    data,
-    status: 200,
-    statusText: 'OK',
-    headers: {},
-    config: { headers: new AxiosHeaders() },
-  };
+/**
+ * Mocks the shape of the Twilio SDK's REST error, thrown by `client.messages.create`
+ * for a non-2xx response (see `node_modules/twilio/lib/base/RestException.js`): a plain
+ * `Error` subclass carrying the HTTP status as `.status`, not `.response.status` like axios.
+ */
+class FakeRestException extends Error {
+  status: number;
+  constructor(status: number, message = 'Request failed') {
+    super(message);
+    this.status = status;
+  }
 }
 
+/** Mocks a Twilio SDK connection/timeout failure: a real axios error with no `.response`. */
+function fakeAxiosNetworkError(code: string, message: string): Error {
+  const error = new Error(message) as Error & { isAxiosError: boolean; code: string };
+  error.isAxiosError = true;
+  error.code = code;
+  return error;
+}
+
+const createMock = jest.fn();
+
+jest.mock('twilio', () => jest.fn(() => ({ messages: { create: createMock } })));
+
 describe('TwilioProvider', () => {
-  it('POSTs a form-encoded message with basic auth and returns the sid on success', async () => {
-    const post = jest.fn(() => of(okResponse({ sid: 'SM-123' })));
-    const httpService = { post } as unknown as HttpService;
-    const provider = new TwilioProvider(httpService, createConfigService());
+  beforeEach(() => {
+    createMock.mockReset();
+  });
+
+  it('calls the Twilio SDK with to/from/body and returns the sid on success', async () => {
+    createMock.mockResolvedValue({ sid: 'SM-123' });
+    const provider = new TwilioProvider(createConfigService());
 
     const result = await provider.sendSms(options);
 
     expect(result).toEqual({ success: true, providerMessageId: 'SM-123', isRetryable: false });
-
-    const [url, requestBody, requestConfig] = post.mock.calls[0] as unknown as [
-      string,
-      string,
-      { auth: { username: string; password: string }; headers: Record<string, string> },
-    ];
-    expect(url).toBe('https://api.twilio.com/2010-04-01/Accounts/AC-test-sid/Messages.json');
-    expect(requestBody).toBe('To=%2B14155552671&From=%2B14155550000&Body=hello');
-    expect(requestConfig.auth).toEqual({ username: 'AC-test-sid', password: 'test-auth-token' });
-    expect(requestConfig.headers['Content-Type']).toBe('application/x-www-form-urlencoded');
+    expect(createMock).toHaveBeenCalledWith({
+      to: '+14155552671',
+      from: '+14155550000',
+      body: 'hello',
+    });
   });
 
   it('resolves a retryable failure on a 429 response instead of throwing', async () => {
-    const response = {
-      status: 429,
-      statusText: 'Too Many Requests',
-      headers: {},
-      config: { headers: new AxiosHeaders() },
-      data: {},
-    } as AxiosResponse;
-    const error = new AxiosError('rate limited', 'ERR_BAD_RESPONSE', undefined, {}, response);
-    const post = jest.fn(() => throwError(() => error));
-    const httpService = { post } as unknown as HttpService;
-    const provider = new TwilioProvider(httpService, createConfigService());
+    createMock.mockRejectedValue(new FakeRestException(429));
+    const provider = new TwilioProvider(createConfigService());
 
     const result = await provider.sendSms(options);
 
@@ -77,17 +78,8 @@ describe('TwilioProvider', () => {
   });
 
   it('resolves a permanent failure on a 400 response', async () => {
-    const response = {
-      status: 400,
-      statusText: 'Bad Request',
-      headers: {},
-      config: { headers: new AxiosHeaders() },
-      data: {},
-    } as AxiosResponse;
-    const error = new AxiosError('bad request', 'ERR_BAD_REQUEST', undefined, {}, response);
-    const post = jest.fn(() => throwError(() => error));
-    const httpService = { post } as unknown as HttpService;
-    const provider = new TwilioProvider(httpService, createConfigService());
+    createMock.mockRejectedValue(new FakeRestException(400));
+    const provider = new TwilioProvider(createConfigService());
 
     const result = await provider.sendSms(options);
 
@@ -96,10 +88,10 @@ describe('TwilioProvider', () => {
   });
 
   it('resolves an ambiguous timeout as retryable and tagged', async () => {
-    const error = new AxiosError('timeout of 10000ms exceeded', 'ECONNABORTED');
-    const post = jest.fn(() => throwError(() => error));
-    const httpService = { post } as unknown as HttpService;
-    const provider = new TwilioProvider(httpService, createConfigService());
+    createMock.mockRejectedValue(
+      fakeAxiosNetworkError('ECONNABORTED', 'timeout of 10000ms exceeded'),
+    );
+    const provider = new TwilioProvider(createConfigService());
 
     const result = await provider.sendSms(options);
 

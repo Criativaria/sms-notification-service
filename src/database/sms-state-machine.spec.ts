@@ -13,7 +13,9 @@ const validTransitions: Array<[SmsStatus, SmsStatus]> = [
   ['RETRY_SCHEDULED', 'PROCESSING'],
   ['PROCESSING', 'AWAITING_PROVIDER_RESULT'],
   ['AWAITING_PROVIDER_RESULT', 'SENT'],
+  ['AWAITING_PROVIDER_RESULT', 'DELIVERED'],
   ['AWAITING_PROVIDER_RESULT', 'UNDELIVERED'],
+  ['AWAITING_PROVIDER_RESULT', 'REJECTED'],
   ['AWAITING_PROVIDER_RESULT', 'PROCESSING'],
   ['PROCESSING', 'RETRY_SCHEDULED'],
   ['PROCESSING', 'REJECTED'],
@@ -133,7 +135,7 @@ describe('sms-state-machine', () => {
     });
 
     it('lists the states a delivery webhook can move to DELIVERED from', () => {
-      expect(sourceStatesOf('DELIVERED')).toEqual(['SENT']);
+      expect(sourceStatesOf('DELIVERED')).toEqual(['AWAITING_PROVIDER_RESULT', 'SENT']);
     });
 
     it('includes PROCESSING, SENT, and the ambiguous reservation as sources of UNDELIVERED', () => {

@@ -7,6 +7,10 @@
  */
 export const SMS_DISPATCH_QUEUE = 'sms-dispatch';
 export const SMS_DLQ_QUEUE = 'sms-dlq';
+export const SMS_MAINTENANCE_QUEUE = 'sms-maintenance';
+export const RETENTION_CLEANUP_JOB = 'retention-cleanup';
+export const PROCESSING_RECOVERY_JOB = 'processing-recovery';
+export const AMBIGUOUS_OUTCOME_EXPIRY_JOB = 'ambiguous-outcome-expiry';
 
 /** Default outbox relay poll interval, in milliseconds. Overridable via `OUTBOX_RELAY_INTERVAL_MS`. */
 export const DEFAULT_OUTBOX_RELAY_INTERVAL_MS = 2000;

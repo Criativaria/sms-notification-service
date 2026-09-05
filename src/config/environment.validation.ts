@@ -49,6 +49,12 @@ const configurationSchema = Joi.object({
   IDEMPOTENCY_TTL_HOURS: Joi.number().integer().positive().default(24),
   PROVIDER_MAX_RETRY_ROUNDS: Joi.number().integer().positive().default(3),
   SMS_PROVIDER_TPS: Joi.number().integer().positive().default(10),
+  SMS_PROVIDER_TPS_TWILIO: Joi.number().integer().positive(),
+  SMS_PROVIDER_TPS_BIRD: Joi.number().integer().positive(),
+  PROCESSING_RECOVERY_INTERVAL_MS: Joi.number().integer().positive().default(60_000),
+  PROCESSING_STALE_AFTER_MS: Joi.number().integer().positive().default(300_000),
+  PROCESSING_RECOVERY_BATCH_SIZE: Joi.number().integer().positive().default(100),
+  AMBIGUOUS_OUTCOME_EXPIRY_MS: Joi.number().integer().positive().default(900_000),
   ENCRYPTION_KEY: Joi.string()
     .base64()
     .custom((value: string, helpers) =>

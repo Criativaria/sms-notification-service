@@ -1,7 +1,7 @@
 import { plainToInstance } from 'class-transformer';
 import { validateSync } from 'class-validator';
 
-import { SendSmsDto } from './send-sms.dto';
+import { MAX_METADATA_BYTES, SendSmsDto } from './send-sms.dto';
 
 function validate(payload: Record<string, unknown>): string[] {
   const instance = plainToInstance(SendSmsDto, payload);
@@ -32,5 +32,29 @@ describe('SendSmsDto', () => {
 
   it('rejects metadata that is not an object', () => {
     expect(validate({ to: '+14155552671', message: 'hi', metadata: 'nope' })).toContain('isObject');
+  });
+
+  it('accepts metadata at exactly the size limit', () => {
+    // `{"k":"aaa...a"}` — pad so the serialized object lands exactly at the byte limit.
+    const overhead = '{"k":""}'.length;
+    const metadata = { k: 'a'.repeat(MAX_METADATA_BYTES - overhead) };
+    expect(Buffer.byteLength(JSON.stringify(metadata), 'utf-8')).toBe(MAX_METADATA_BYTES);
+
+    expect(validate({ to: '+14155552671', message: 'hi', metadata })).toEqual([]);
+  });
+
+  it('rejects metadata one byte over the size limit', () => {
+    const overhead = '{"k":""}'.length;
+    const metadata = { k: 'a'.repeat(MAX_METADATA_BYTES - overhead + 1) };
+    expect(Buffer.byteLength(JSON.stringify(metadata), 'utf-8')).toBe(MAX_METADATA_BYTES + 1);
+
+    expect(validate({ to: '+14155552671', message: 'hi', metadata })).toContain(
+      'isBoundedMetadata',
+    );
+  });
+
+  it('rejects an oversized metadata array the same way as an oversized object', () => {
+    const metadata = Array.from({ length: 2000 }, (_, i) => i);
+    expect(validate({ to: '+14155552671', message: 'hi', metadata })).toContain('isObject');
   });
 });

@@ -42,7 +42,13 @@ const transitionTable: Readonly<Record<SmsStatus, ReadonlySet<SmsStatus>>> = {
   // A provider invocation has been durably reserved. A definitive result (success or a
   // clean provider response) can advance or release it; an ambiguous result (timeout/no
   // response) leaves it here for audited operator resolution — never an automatic retry.
-  AWAITING_PROVIDER_RESULT: new Set<SmsStatus>(['SENT', 'UNDELIVERED', 'PROCESSING']),
+  AWAITING_PROVIDER_RESULT: new Set<SmsStatus>([
+    'SENT',
+    'DELIVERED',
+    'UNDELIVERED',
+    'REJECTED',
+    'PROCESSING',
+  ]),
   // SENT may only advance via delivery webhooks.
   SENT: new Set<SmsStatus>(['DELIVERED', 'UNDELIVERED', 'REJECTED']),
   // Terminal states: no outgoing transitions.

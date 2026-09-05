@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import { EncryptionService } from '../../common/crypto/encryption.service';
@@ -68,6 +68,21 @@ describe('SmsService', () => {
     });
   });
 
+  it('logs a masked MESSAGE_QUEUED event only when it creates a message', async () => {
+    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation();
+    const { service } = createService();
+
+    await service.acceptMessage('request-123', body({ message: 'secret text' }));
+
+    expect(log).toHaveBeenCalledWith({
+      event: 'MESSAGE_QUEUED',
+      messageId: persistedMessage.id,
+      recipient: '+1415***2671',
+      message: '[body len=11]',
+    });
+    log.mockRestore();
+  });
+
   it('forwards optional metadata to the repository', async () => {
     const { service, createOrGetMessage } = createService();
 
@@ -80,7 +95,19 @@ describe('SmsService', () => {
     );
   });
 
+  it('rejects oversized metadata before encryption or persistence', async () => {
+    const { service, encrypt, createOrGetMessage } = createService();
+
+    await expect(
+      service.acceptMessage('request-123', body({ metadata: { value: 'x'.repeat(4097) } })),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(encrypt).not.toHaveBeenCalled();
+    expect(createOrGetMessage).not.toHaveBeenCalled();
+  });
+
   it('returns the existing record for a duplicate idempotency key without new work', async () => {
+    const log = jest.spyOn(Logger.prototype, 'log').mockImplementation();
     const { service, createOrGetMessage } = createService({ created: false });
 
     const result = await service.acceptMessage('request-123', body());
@@ -88,6 +115,8 @@ describe('SmsService', () => {
     expect(result.messageId).toBe(persistedMessage.id);
     expect(result.status).toBe('QUEUED');
     expect(createOrGetMessage).toHaveBeenCalledTimes(1);
+    expect(log).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'MESSAGE_QUEUED' }));
+    log.mockRestore();
   });
 
   it('rejects a missing idempotency key with 400', async () => {

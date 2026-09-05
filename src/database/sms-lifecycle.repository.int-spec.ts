@@ -106,7 +106,7 @@ describe('SmsLifecycleRepository (integration, live PostgreSQL)', () => {
     expect(attempt.isRetryable).toBe(true);
   });
 
-  it('leaves an ambiguous failure parked in AWAITING_PROVIDER_RESULT', async () => {
+  it('commits an expiry outbox event with an ambiguous failure', async () => {
     const message = await persistence.createOrGetMessage({
       idempotencyKey: `attempt-${randomUUID()}`,
       recipientPhone: '+14155552671',
@@ -126,6 +126,7 @@ describe('SmsLifecycleRepository (integration, live PostgreSQL)', () => {
       isAmbiguous: true,
       isRetryable: true,
       errorMessage: '[timeout] twilio request timed out',
+      ambiguousOutcomeExpiryMs: 900_000,
     });
 
     const parked = await client.smsMessage.findUniqueOrThrow({
@@ -137,5 +138,108 @@ describe('SmsLifecycleRepository (integration, live PostgreSQL)', () => {
       where: { id: reservation.attemptId },
     });
     expect(attempt.isAmbiguous).toBe(true);
+    await expect(
+      client.outboxEvent.findFirst({
+        where: {
+          aggregateId: message.message.id,
+          eventType: 'SMS_AMBIGUOUS_OUTCOME_EXPIRY_SCHEDULED',
+        },
+      }),
+    ).resolves.toMatchObject({ payload: { messageId: message.message.id, delayMs: 900_000 } });
+  });
+
+  it('leaves an expiry job harmless after a delivery report wins the race', async () => {
+    const message = await persistence.createOrGetMessage({
+      idempotencyKey: `expiry-webhook-${randomUUID()}`,
+      recipientPhone: '+14155552671',
+      encryptedMessage: 'encrypted-payload',
+    });
+    createdMessageIds.push(message.message.id);
+    const client = prisma as unknown as PrismaClient;
+    const providerMessageId = `twilio-webhook-${randomUUID()}`;
+
+    await client.smsMessage.update({
+      where: { id: message.message.id },
+      data: { status: 'AWAITING_PROVIDER_RESULT', providerMessageId },
+    });
+    await expect(
+      lifecycle.applyDeliveryReport({ providerMessageId, terminalStatus: 'DELIVERED' }),
+    ).resolves.toMatchObject({ outcome: 'applied' });
+    await expect(lifecycle.expireAmbiguousOutcome(message.message.id)).resolves.toEqual({
+      outcome: 'not_awaiting_provider_result',
+    });
+    await expect(
+      client.smsMessage.findUniqueOrThrow({ where: { id: message.message.id } }),
+    ).resolves.toMatchObject({ status: 'DELIVERED' });
+  });
+
+  it('finalizes an unresolved ambiguous outcome as UNDELIVERED without creating dispatch work', async () => {
+    const message = await persistence.createOrGetMessage({
+      idempotencyKey: `expiry-${randomUUID()}`,
+      recipientPhone: '+14155552671',
+      encryptedMessage: 'encrypted-payload',
+    });
+    createdMessageIds.push(message.message.id);
+    const client = prisma as unknown as PrismaClient;
+
+    await client.smsMessage.update({
+      where: { id: message.message.id },
+      data: { status: 'AWAITING_PROVIDER_RESULT' },
+    });
+    await expect(lifecycle.expireAmbiguousOutcome(message.message.id)).resolves.toEqual({
+      outcome: 'expired',
+    });
+    await expect(
+      client.smsMessage.findUniqueOrThrow({ where: { id: message.message.id } }),
+    ).resolves.toMatchObject({ status: 'UNDELIVERED', lastError: 'AMBIGUOUS_OUTCOME_EXPIRED' });
+    await expect(
+      client.outboxEvent.count({ where: { aggregateId: message.message.id } }),
+    ).resolves.toBe(1);
+  });
+
+  it('recovers only stale PROCESSING rows without changing counters or touching AWAITING_PROVIDER_RESULT', async () => {
+    const recoverable = await persistence.createOrGetMessage({
+      idempotencyKey: `recovery-${randomUUID()}`,
+      recipientPhone: '+14155552671',
+      encryptedMessage: 'encrypted-payload',
+    });
+    const awaiting = await persistence.createOrGetMessage({
+      idempotencyKey: `awaiting-${randomUUID()}`,
+      recipientPhone: '+14155552671',
+      encryptedMessage: 'encrypted-payload',
+    });
+    createdMessageIds.push(recoverable.message.id, awaiting.message.id);
+    const client = prisma as unknown as PrismaClient;
+    const staleAt = new Date('2026-09-04T10:00:00.000Z');
+    const cutoff = new Date('2026-09-04T11:00:00.000Z');
+
+    await client.smsMessage.update({
+      where: { id: recoverable.message.id },
+      data: { status: 'PROCESSING', updatedAt: staleAt },
+    });
+    await client.smsMessage.update({
+      where: { id: awaiting.message.id },
+      data: { status: 'AWAITING_PROVIDER_RESULT', updatedAt: staleAt },
+    });
+
+    await expect(lifecycle.recoverStaleProcessing(cutoff, 10)).resolves.toEqual({ recovered: 1 });
+
+    await expect(
+      client.smsMessage.findUniqueOrThrow({ where: { id: recoverable.message.id } }),
+    ).resolves.toMatchObject({
+      status: 'RETRY_SCHEDULED',
+      deliveryAttempts: 0,
+      retryRounds: 0,
+    });
+    await expect(
+      client.smsMessage.findUniqueOrThrow({ where: { id: awaiting.message.id } }),
+    ).resolves.toMatchObject({
+      status: 'AWAITING_PROVIDER_RESULT',
+    });
+    await expect(
+      client.outboxEvent.count({
+        where: { aggregateId: recoverable.message.id, eventType: 'SMS_PROCESSING_RECOVERED' },
+      }),
+    ).resolves.toBe(1);
   });
 });

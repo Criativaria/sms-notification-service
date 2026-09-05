@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
+import { JobsOptions, Queue } from 'bullmq';
 
 import { SmsLifecycleRepository } from '../../database/sms-lifecycle.repository';
 import {
@@ -9,6 +9,7 @@ import {
   DEFAULT_OUTBOX_RELAY_INTERVAL_MS,
   SMS_DISPATCH_QUEUE,
   SMS_DLQ_QUEUE,
+  SMS_MAINTENANCE_QUEUE,
   SmsDispatchJobData,
 } from './queue.constants';
 
@@ -17,7 +18,8 @@ import {
  * and enqueues a deterministic `sms-dispatch` job per event, then marks the event
  * published. This decouples the write path (which only appends an outbox row inside the
  * same transaction as the message) from Redis availability: an event that fails to
- * enqueue stays unpublished and is retried on the next tick (reconciliation).
+ * enqueue stays unpublished and is retried on the next tick (reconciliation). Jobs are
+ * removed after either terminal queue outcome because PostgreSQL remains the durable record.
  *
  * `@nestjs/schedule` is intentionally not a dependency, so the loop is a plain
  * `setInterval` started in `onModuleInit` and cleared in `onModuleDestroy`.
@@ -33,6 +35,8 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
   constructor(
     @InjectQueue(SMS_DISPATCH_QUEUE) private readonly dispatchQueue: Queue<SmsDispatchJobData>,
     @InjectQueue(SMS_DLQ_QUEUE) private readonly deadLetterQueue: Queue<SmsDispatchJobData>,
+    @InjectQueue(SMS_MAINTENANCE_QUEUE)
+    private readonly maintenanceQueue: Queue<SmsDispatchJobData>,
     private readonly lifecycle: SmsLifecycleRepository,
     configService: ConfigService,
   ) {
@@ -84,11 +88,20 @@ export class OutboxRelayService implements OnModuleInit, OnModuleDestroy {
 
     for (const event of events) {
       try {
-        const job = queueJobFor(event, this.dispatchQueue, this.deadLetterQueue);
+        const job = queueJobFor(
+          event,
+          this.dispatchQueue,
+          this.deadLetterQueue,
+          this.maintenanceQueue,
+        );
+        // Deterministic job id derived from the internal message id, scoped by the outbox
+        // event id so a replay of the same event still dedupes (a message can produce
+        // several outbox events of the same type over its lifetime, e.g. one per retry
+        // round, and each must still get its own job).
         await job.queue.add(
           job.name,
           { messageId: job.messageId },
-          { jobId: event.id, ...job.options },
+          { jobId: `${job.messageId}#${event.id}`, ...job.options },
         );
         await this.lifecycle.markOutboxPublished(event.id);
       } catch (error) {
@@ -104,11 +117,12 @@ function queueJobFor(
   event: { eventType: string; aggregateId: string; payload: unknown },
   dispatchQueue: Queue<SmsDispatchJobData>,
   deadLetterQueue: Queue<SmsDispatchJobData>,
+  maintenanceQueue: Queue<SmsDispatchJobData>,
 ): {
   queue: Queue<SmsDispatchJobData>;
-  name: 'dispatch' | 'retry' | 'dead-letter' | 'requeue';
+  name: 'dispatch' | 'retry' | 'dead-letter' | 'requeue' | 'recovered' | 'ambiguous-outcome-expiry';
   messageId: string;
-  options: { delay?: number };
+  options: JobsOptions;
 } {
   const payload = readDispatchPayload(event.payload, event.aggregateId);
 
@@ -120,12 +134,17 @@ function queueJobFor(
       queue: dispatchQueue,
       name: 'retry',
       messageId: payload.messageId,
-      options: { delay: payload.delayMs },
+      options: { delay: payload.delayMs, ...ephemeralJobOptions },
     };
   }
 
   if (event.eventType === 'SMS_MESSAGE_QUEUED') {
-    return { queue: dispatchQueue, name: 'dispatch', messageId: payload.messageId, options: {} };
+    return {
+      queue: dispatchQueue,
+      name: 'dispatch',
+      messageId: payload.messageId,
+      options: ephemeralJobOptions,
+    };
   }
 
   if (event.eventType === 'SMS_DEAD_LETTERED') {
@@ -133,16 +152,44 @@ function queueJobFor(
       queue: deadLetterQueue,
       name: 'dead-letter',
       messageId: payload.messageId,
-      options: {},
+      options: ephemeralJobOptions,
     };
   }
 
   if (event.eventType === 'SMS_REQUEUED') {
-    return { queue: dispatchQueue, name: 'requeue', messageId: payload.messageId, options: {} };
+    return {
+      queue: dispatchQueue,
+      name: 'requeue',
+      messageId: payload.messageId,
+      options: ephemeralJobOptions,
+    };
+  }
+
+  if (event.eventType === 'SMS_PROCESSING_RECOVERED') {
+    return {
+      queue: dispatchQueue,
+      name: 'recovered',
+      messageId: payload.messageId,
+      options: ephemeralJobOptions,
+    };
+  }
+
+  if (event.eventType === 'SMS_AMBIGUOUS_OUTCOME_EXPIRY_SCHEDULED') {
+    if (payload.delayMs === undefined) {
+      throw new Error(`Ambiguous-outcome expiry event ${event.aggregateId} is missing delayMs`);
+    }
+    return {
+      queue: maintenanceQueue,
+      name: 'ambiguous-outcome-expiry',
+      messageId: payload.messageId,
+      options: { delay: payload.delayMs, ...ephemeralJobOptions },
+    };
   }
 
   throw new Error(`Unsupported outbox event type ${event.eventType}`);
 }
+
+const ephemeralJobOptions = { removeOnComplete: true, removeOnFail: true } as const;
 
 function readDispatchPayload(
   payload: unknown,

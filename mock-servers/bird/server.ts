@@ -1,8 +1,8 @@
 /**
- * Minimal local mock of Bird's Messages API, for demo/dev use only.
+ * Minimal local mock of Bird's Messages API for demonstration and development use only.
  *
- * NOT a maintained service — built for a single presentation. No real Bird credentials
- * are used or required. See docs/provider-sandbox.md for the demo walkthrough.
+ * This mock is not maintained and is intended only for a single demonstration. No real Bird
+ * credentials are used or required. See docs/provider-sandbox.md for the demonstration walkthrough.
  *
  * Endpoints:
  *   POST /workspaces/:workspaceId/channels/:channelId/messages
@@ -38,7 +38,7 @@
  *   SERVICE_URL               - base URL of the running SMS service (default http://localhost:3000)
  *   BIRD_WEBHOOK_SIGNING_KEY  - must match the real service's BIRD_WEBHOOK_SIGNING_KEY so the
  *                               simulated callback signature verifies. Defaults to the same
- *                               local dev value already committed in this repo's .env
+ *                               local development value defined in this repository's environment configuration
  *                               ("test-bird-webhook-key"), which is not a real secret.
  */
 import { createHmac, randomUUID } from 'node:crypto';
@@ -70,61 +70,75 @@ app.get('/health', (_req: Request, res: Response) => {
   res.status(200).json({ ok: true });
 });
 
-app.post(
-  '/workspaces/:workspaceId/channels/:channelId/messages',
-  (req: Request, res: Response) => {
-    const { workspaceId, channelId } = req.params;
-    const authorization = req.header('authorization');
+app.post('/workspaces/:workspaceId/channels/:channelId/messages', (req: Request, res: Response) => {
+  const { workspaceId, channelId } = req.params;
+  const authorization = req.header('authorization');
 
-    if (!authorization || !authorization.trim()) {
-      res.status(401).json({ errors: [{ code: 'unauthorized', description: 'Missing Authorization header' }] });
-      return;
-    }
+  if (!authorization || !authorization.trim()) {
+    res
+      .status(401)
+      .json({ errors: [{ code: 'unauthorized', description: 'Missing Authorization header' }] });
+    return;
+  }
 
-    const to = req.body?.receiver?.contacts?.[0]?.identifierValue;
-    const text = req.body?.body?.text?.text;
-    if (!to || typeof text !== 'string') {
-      res.status(400).json({
-        errors: [{ code: 'invalid_request', description: 'Missing receiver.contacts[0].identifierValue or body.text.text' }],
-      });
-      return;
-    }
-
-    const force = (req.header('x-mock-force') ?? '').toLowerCase();
-
-    if (force === 'timeout') {
-      // Deliberately never respond and never end the socket, to simulate a hung request.
-      return;
-    }
-
-    if (force === 'retryable') {
-      res.status(503).json({
-        errors: [{ code: 'service_unavailable', description: 'Mocked transient Bird failure (X-Mock-Force: retryable)' }],
-      });
-      return;
-    }
-
-    if (force === 'permanent') {
-      res.status(400).json({
-        errors: [{ code: 'invalid_receiver', description: 'Mocked permanent Bird failure (X-Mock-Force: permanent)' }],
-      });
-      return;
-    }
-
-    const id = `bird-mock-${randomUUID()}`;
-    messages.set(id, {
-      id,
-      workspaceId: String(workspaceId),
-      channelId: String(channelId),
-      to,
-      text,
-      reference: req.body?.reference,
-      createdAt: new Date().toISOString(),
+  const to = req.body?.receiver?.contacts?.[0]?.identifierValue;
+  const text = req.body?.body?.text?.text;
+  if (!to || typeof text !== 'string') {
+    res.status(400).json({
+      errors: [
+        {
+          code: 'invalid_request',
+          description: 'Missing receiver.contacts[0].identifierValue or body.text.text',
+        },
+      ],
     });
+    return;
+  }
 
-    res.status(200).json({ id });
-  },
-);
+  const force = (req.header('x-mock-force') ?? '').toLowerCase();
+
+  if (force === 'timeout') {
+    // Deliberately never respond and never end the socket, to simulate a hung request.
+    return;
+  }
+
+  if (force === 'retryable') {
+    res.status(503).json({
+      errors: [
+        {
+          code: 'service_unavailable',
+          description: 'Mocked transient Bird failure (X-Mock-Force: retryable)',
+        },
+      ],
+    });
+    return;
+  }
+
+  if (force === 'permanent') {
+    res.status(400).json({
+      errors: [
+        {
+          code: 'invalid_receiver',
+          description: 'Mocked permanent Bird failure (X-Mock-Force: permanent)',
+        },
+      ],
+    });
+    return;
+  }
+
+  const id = `bird-mock-${randomUUID()}`;
+  messages.set(id, {
+    id,
+    workspaceId: String(workspaceId),
+    channelId: String(channelId),
+    to,
+    text,
+    reference: req.body?.reference,
+    createdAt: new Date().toISOString(),
+  });
+
+  res.status(200).json({ id });
+});
 
 app.get('/messages/:id', (req: Request, res: Response) => {
   const message = messages.get(String(req.params.id));
@@ -182,10 +196,14 @@ app.post('/simulate-callback/:messageId', async (req: Request, res: Response) =>
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  res.status(500).json({ error: 'mock_server_error', detail: err instanceof Error ? err.message : String(err) });
+  res
+    .status(500)
+    .json({ error: 'mock_server_error', detail: err instanceof Error ? err.message : String(err) });
 });
 
 app.listen(PORT, () => {
   // eslint-disable-next-line no-console
-  console.log(`[bird-mock] listening on http://localhost:${PORT} (forwarding callbacks to ${SERVICE_URL})`);
+  console.log(
+    `[bird-mock] listening on http://localhost:${PORT} (forwarding callbacks to ${SERVICE_URL})`,
+  );
 });

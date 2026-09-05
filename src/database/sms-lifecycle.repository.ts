@@ -51,7 +51,13 @@ export type ReserveProviderAttemptResult =
  */
 export type FinalizeProviderAttemptInput =
   | { outcome: 'ACCEPTED'; providerMessageId: string }
-  | { outcome: 'FAILED'; isAmbiguous: boolean; isRetryable: boolean; errorMessage: string };
+  | {
+      outcome: 'FAILED';
+      isAmbiguous: boolean;
+      isRetryable: boolean;
+      errorMessage: string;
+      ambiguousOutcomeExpiryMs?: number;
+    };
 
 export type ResolveTwilioAttemptInput =
   | { resolution: 'KNOWN_SID'; providerMessageId: string }
@@ -82,6 +88,9 @@ export type ResetForRequeueResult =
   | { outcome: 'requeued'; message: LifecycleSmsMessage }
   | { outcome: 'not_found' }
   | { outcome: 'not_fatal'; currentStatus: SmsStatus };
+
+export type ExpireAmbiguousOutcomeResult =
+  { outcome: 'expired' } | { outcome: 'not_awaiting_provider_result' };
 
 export type PermanentProviderFailureStatus = 'REJECTED' | 'UNDELIVERED';
 export type DeliveryTerminalStatus = 'DELIVERED' | 'UNDELIVERED' | 'REJECTED';
@@ -223,6 +232,46 @@ export class SmsLifecycleRepository {
   }
 
   /**
+   * Releases messages abandoned before a provider attempt was reserved. The second status and
+   * timestamp check is the concurrency boundary: a worker that resumes after selection wins
+   * the race and no recovery event is created, preventing a duplicate provider submission.
+   */
+  async recoverStaleProcessing(cutoff: Date, limit: number): Promise<{ recovered: number }> {
+    const candidates = await this.prisma.smsMessage.findMany({
+      where: { status: 'PROCESSING', updatedAt: { lt: cutoff } },
+      orderBy: { updatedAt: 'asc' },
+      select: { id: true },
+      take: limit,
+    });
+
+    let recovered = 0;
+    for (const candidate of candidates) {
+      const didRecover = await this.prisma.$transaction(async (tx) => {
+        const updated = await tx.smsMessage.updateMany({
+          where: { id: candidate.id, status: 'PROCESSING', updatedAt: { lt: cutoff } },
+          data: { status: 'RETRY_SCHEDULED' },
+        });
+        if (updated.count === 0) {
+          return false;
+        }
+
+        await tx.outboxEvent.create({
+          data: {
+            aggregateType: 'SMS_MESSAGE',
+            aggregateId: candidate.id,
+            eventType: 'SMS_PROCESSING_RECOVERED',
+            payload: { messageId: candidate.id },
+          },
+        });
+        return true;
+      });
+      recovered += Number(didRecover);
+    }
+
+    return { recovered };
+  }
+
+  /**
    * Establishes the durable boundary immediately before a provider invocation. A replay can
    * never pass this point: once reserved, the message is no longer startable by a worker.
    */
@@ -315,7 +364,21 @@ export class SmsLifecycleRepository {
       }
 
       if (isAmbiguous) {
+        const delayMs = input.ambiguousOutcomeExpiryMs;
+        if (typeof delayMs !== 'number' || !Number.isInteger(delayMs) || delayMs <= 0) {
+          throw new Error('ambiguousOutcomeExpiryMs must be a positive integer');
+        }
         // Stays in AWAITING_PROVIDER_RESULT: never auto-retried, never auto-failed-over.
+        // The expiry intent is committed with the attempt result, so Redis downtime cannot leave
+        // an ambiguous message parked forever.
+        await tx.outboxEvent.create({
+          data: {
+            aggregateType: 'SMS_MESSAGE',
+            aggregateId: messageId,
+            eventType: 'SMS_AMBIGUOUS_OUTCOME_EXPIRY_SCHEDULED',
+            payload: { messageId, delayMs },
+          },
+        });
         return;
       }
 
@@ -476,6 +539,21 @@ export class SmsLifecycleRepository {
         payload: { messageId },
       },
     );
+  }
+
+  /**
+   * Completes the one-shot expiry of an ambiguous provider outcome. The conditional update is
+   * intentionally the entire concurrency boundary: a valid webhook that won first changes the
+   * status, making this delayed job a harmless no-op. It never creates dispatch work.
+   */
+  async expireAmbiguousOutcome(messageId: string): Promise<ExpireAmbiguousOutcomeResult> {
+    const updated = await this.prisma.smsMessage.updateMany({
+      where: { id: messageId, status: 'AWAITING_PROVIDER_RESULT' },
+      data: { status: 'UNDELIVERED', lastError: 'AMBIGUOUS_OUTCOME_EXPIRED' },
+    });
+    return updated.count === 1
+      ? { outcome: 'expired' }
+      : { outcome: 'not_awaiting_provider_result' };
   }
 
   /**

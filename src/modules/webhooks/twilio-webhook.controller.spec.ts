@@ -31,11 +31,23 @@ function createController(result?: ApplyDeliveryReportResult) {
   const applyDeliveryReport = jest.fn(() => Promise.resolve(result));
   const lifecycle = { applyDeliveryReport } as unknown as SmsLifecycleRepository;
   const configService = {
+    get: (key: string) => (key === 'TWILIO_AUTH_TOKEN' ? AUTH_TOKEN : undefined),
     getOrThrow: (key: string) => (key === 'TWILIO_AUTH_TOKEN' ? AUTH_TOKEN : SERVICE_URL),
   } as unknown as ConfigService;
 
   const controller = new TwilioWebhookController(configService, new WebhooksService(lifecycle));
   return { controller, applyDeliveryReport };
+}
+
+function createUnconfiguredController() {
+  const applyDeliveryReport = jest.fn();
+  const lifecycle = { applyDeliveryReport } as unknown as SmsLifecycleRepository;
+  const configService = {
+    get: () => undefined,
+    getOrThrow: (key: string) => (key === 'SERVICE_URL' ? SERVICE_URL : AUTH_TOKEN),
+  } as unknown as ConfigService;
+
+  return new TwilioWebhookController(configService, new WebhooksService(lifecycle));
 }
 
 describe('TwilioWebhookController', () => {
@@ -115,5 +127,15 @@ describe('TwilioWebhookController', () => {
 
     expect(response).toEqual({ status: 'ignored' });
     expect(applyDeliveryReport).not.toHaveBeenCalled();
+  });
+
+  it('returns 404 when Twilio is not configured on this deployment', async () => {
+    const controller = createUnconfiguredController();
+    const params = { MessageSid: 'SM1', MessageStatus: 'delivered' };
+    const signature = computeTwilioSignature(AUTH_TOKEN, CALLBACK_URL, params);
+
+    await expect(controller.handle(buildRequest(params), signature)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
   });
 });

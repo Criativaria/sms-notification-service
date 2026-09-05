@@ -25,7 +25,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # Local mock of Bird's Messages API — demo/dev only, no real Bird credentials involved.
+  # Local mock of Bird's Messages API for demos and development only; no real Bird credentials are involved.
   # See mock-servers/bird/server.ts and docs/provider-sandbox.md for the contract and demo steps.
   bird-mock:
     image: node:22-alpine

@@ -4,24 +4,40 @@ import { randomUUID } from 'node:crypto';
 
 import { ConflictException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Job, Queue } from 'bullmq';
+import { Job, Queue, QueueEvents, Worker } from 'bullmq';
 
 import { EncryptionService } from '../../common/crypto/encryption.service';
 import { PrismaClient } from '../../generated/prisma/client';
 import { PrismaService } from '../../database/prisma.service';
 import { SmsLifecycleRepository } from '../../database/sms-lifecycle.repository';
 import { SmsPersistenceRepository } from '../../database/sms-persistence.repository';
+import { MetricsService } from '../../observability/metrics.service';
 import { ProviderFactory } from '../providers/provider.factory';
 import { ISmsProvider, SendSmsResult } from '../providers/interfaces/sms-provider.interface';
 import { DlqController } from './dlq.controller';
+import { DlqProcessor } from './dlq.processor';
 import { OutboxRelayService } from './outbox-relay.service';
+import { ProviderRateLimiter } from './provider-rate-limiter';
 import { SmsProcessor } from './sms.processor';
 import {
   backoffDelayMs,
   SMS_DISPATCH_QUEUE,
   SMS_DLQ_QUEUE,
+  SMS_MAINTENANCE_QUEUE,
   SmsDispatchJobData,
 } from './queue.constants';
+
+const unlimitedRateLimiter = {
+  acquire: jest.fn().mockResolvedValue(undefined),
+} as unknown as ProviderRateLimiter;
+
+const metrics = {
+  recordProviderAttempt: jest.fn(),
+  recordProviderError: jest.fn(),
+  recordFailover: jest.fn(),
+  recordDeadLetter: jest.fn(),
+  recordProcessingLatency: jest.fn(),
+} as unknown as MetricsService;
 
 /**
  * Integration coverage for the reliable-delivery pipeline against LIVE Redis (BullMQ) and
@@ -50,6 +66,7 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
   let encryption: EncryptionService;
   let dispatchQueue: Queue<SmsDispatchJobData>;
   let deadLetterQueue: Queue<SmsDispatchJobData>;
+  let maintenanceQueue: Queue<SmsDispatchJobData>;
   let relay: OutboxRelayService;
   let dlqController: DlqController;
 
@@ -109,10 +126,14 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
     deadLetterQueue = new Queue<SmsDispatchJobData>(SMS_DLQ_QUEUE, {
       connection: { url: process.env.REDIS_URL },
     });
+    maintenanceQueue = new Queue<SmsDispatchJobData>(SMS_MAINTENANCE_QUEUE, {
+      connection: { url: process.env.REDIS_URL },
+    });
     // Large interval + no onModuleInit: the relay timer never fires; ticks are driven manually.
     relay = new OutboxRelayService(
       dispatchQueue,
       deadLetterQueue,
+      maintenanceQueue,
       lifecycle,
       new ConfigService({ OUTBOX_RELAY_INTERVAL_MS: 60_000, OUTBOX_RELAY_BATCH_SIZE: 25 }),
     );
@@ -127,17 +148,21 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
       return;
     }
 
-    // Remove any jobs the relay enqueued for these messages from BOTH queues (job id == outbox
-    // event id), then delete only the rows these tests created.
+    // Remove any jobs the relay enqueued for these messages from BOTH queues (job id ==
+    // `${messageId}#${outboxEventId}`), then delete only the rows these tests created.
     const events = await client.outboxEvent.findMany({
       where: { aggregateId: { in: messageIds } },
-      select: { id: true },
+      select: { id: true, aggregateId: true },
     });
     await Promise.all(
-      events.flatMap((event) => [
-        dispatchQueue.remove(event.id).catch(() => undefined),
-        deadLetterQueue.remove(event.id).catch(() => undefined),
-      ]),
+      events.flatMap((event) => {
+        const jobId = `${event.aggregateId}#${event.id}`;
+        return [
+          dispatchQueue.remove(jobId).catch(() => undefined),
+          deadLetterQueue.remove(jobId).catch(() => undefined),
+          maintenanceQueue.remove(jobId).catch(() => undefined),
+        ];
+      }),
     );
 
     await client.outboxEvent.deleteMany({ where: { aggregateId: { in: messageIds } } });
@@ -150,6 +175,7 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
   afterAll(async () => {
     await dispatchQueue.close();
     await deadLetterQueue.close();
+    await maintenanceQueue.close();
     await prisma.$disconnect();
   });
 
@@ -168,6 +194,8 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         ),
         encryption,
         prisma,
+        unlimitedRateLimiter,
+        metrics,
         defaultConfig(),
       );
 
@@ -188,6 +216,22 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         provider: 'twilio',
         outcome: 'FAILED',
         isAmbiguous: true,
+      });
+
+      const expiryEvent = await client.outboxEvent.findFirstOrThrow({
+        where: {
+          aggregateId: messageId,
+          eventType: 'SMS_AMBIGUOUS_OUTCOME_EXPIRY_SCHEDULED',
+        },
+      });
+      expect(expiryEvent.payload).toEqual({ messageId, delayMs: 900_000 });
+      await relay.tick();
+      await expect(
+        maintenanceQueue.getJob(`${messageId}#${expiryEvent.id}`),
+      ).resolves.toMatchObject({
+        name: 'ambiguous-outcome-expiry',
+        data: { messageId },
+        opts: { delay: 900_000 },
       });
     });
 
@@ -212,6 +256,8 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         } as unknown as ProviderFactory,
         encryption,
         prisma,
+        unlimitedRateLimiter,
+        metrics,
         defaultConfig(),
       );
 
@@ -256,6 +302,8 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
         } as unknown as ProviderFactory,
         encryption,
         prisma,
+        unlimitedRateLimiter,
+        metrics,
         defaultConfig(),
       );
 
@@ -300,7 +348,7 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
       });
       expect(publishedRetryEvent.publishedAt).toBeInstanceOf(Date);
 
-      const retryJob = await dispatchQueue.getJob(retryEvent.id);
+      const retryJob = await dispatchQueue.getJob(`${messageId}#${retryEvent.id}`);
       expect(retryJob?.name).toBe('retry');
       expect(retryJob?.data).toEqual({ messageId });
       // Backoff is carried as the BullMQ job delay.
@@ -332,11 +380,46 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
 
       await relay.tick();
 
-      const dlqJob = await deadLetterQueue.getJob(deadLetterEvent.id);
+      const dlqJobId = `${messageId}#${deadLetterEvent.id}`;
+      const dlqJob = await deadLetterQueue.getJob(dlqJobId);
       expect(dlqJob?.name).toBe('dead-letter');
       expect(dlqJob?.data).toEqual({ messageId });
       // The dead-letter job must land on the DLQ, never back on the dispatch queue.
-      expect(await dispatchQueue.getJob(deadLetterEvent.id)).toBeUndefined();
+      expect(await dispatchQueue.getJob(dlqJobId)).toBeUndefined();
+    });
+
+    it('consumes and removes the ephemeral DLQ notification while preserving PostgreSQL state', async () => {
+      const messageId = await createQueuedMessage();
+      await moveToProcessing(messageId);
+      await lifecycle.markFatalFailure(messageId, 'DLQ notification cleanup test');
+      const deadLetterEvent = await client.outboxEvent.findFirstOrThrow({
+        where: { aggregateId: messageId, eventType: 'SMS_DEAD_LETTERED' },
+      });
+      const notificationMetrics = { recordDeadLetterNotification: jest.fn() };
+      const processor = new DlqProcessor(notificationMetrics as unknown as MetricsService);
+      const events = new QueueEvents(SMS_DLQ_QUEUE, { connection: { url: process.env.REDIS_URL } });
+      const worker = new Worker<SmsDispatchJobData>(
+        SMS_DLQ_QUEUE,
+        (job) => processor.process(job),
+        { connection: { url: process.env.REDIS_URL } },
+      );
+
+      const dlqJobId = `${messageId}#${deadLetterEvent.id}`;
+      try {
+        await events.waitUntilReady();
+        await relay.tick();
+        const notification = await deadLetterQueue.getJob(dlqJobId);
+        await notification?.waitUntilFinished(events);
+
+        expect(notificationMetrics.recordDeadLetterNotification).toHaveBeenCalled();
+        expect(await deadLetterQueue.getJob(dlqJobId)).toBeUndefined();
+        expect(
+          (await client.smsMessage.findUniqueOrThrow({ where: { id: messageId } })).status,
+        ).toBe('FATAL_FAILURE');
+      } finally {
+        await worker.close();
+        await events.close();
+      }
     });
   });
 
@@ -346,9 +429,16 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
       await lifecycle.markFatalFailure(messageId, 'exhausted for requeue test');
     }
 
-    it('requeues a FATAL_FAILURE message back to RETRY_SCHEDULED with an audited outbox record', async () => {
+    it('requeues from PostgreSQL even when no Redis DLQ job exists', async () => {
       const messageId = await createQueuedMessage();
       await deadLetter(messageId);
+
+      // Do not relay the dead-letter event: no Redis DLQ job exists to consult or restore.
+      expect(
+        await client.outboxEvent.count({
+          where: { aggregateId: messageId, eventType: 'SMS_DEAD_LETTERED', publishedAt: null },
+        }),
+      ).toBe(1);
 
       const response = await dlqController.requeue(messageId);
       expect(response).toEqual({ messageId, status: 'requeued' });
@@ -366,7 +456,7 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
 
       await relay.tick();
 
-      const requeueJob = await dispatchQueue.getJob(requeueEvents[0]!.id);
+      const requeueJob = await dispatchQueue.getJob(`${messageId}#${requeueEvents[0]!.id}`);
       expect(requeueJob?.name).toBe('requeue');
       expect(requeueJob?.data).toEqual({ messageId });
     });
@@ -389,11 +479,11 @@ describe('SMS dispatch reliability (integration, live PostgreSQL and Redis)', ()
   });
 
   describe('per-provider rate limiting', () => {
-    it('constructs the dispatch worker with the configured 10 TPS limiter', () => {
+    it('does not apply a global worker limiter because provider calls use independent Redis limits', () => {
       const workerOptions = Reflect.getMetadata('bullmq:worker_metadata', SmsProcessor) as
         { limiter?: { max: number; duration: number } } | undefined;
 
-      expect(workerOptions?.limiter).toEqual({ max: 10, duration: 1000 });
+      expect(workerOptions?.limiter).toBeUndefined();
     });
   });
 });

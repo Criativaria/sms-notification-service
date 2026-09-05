@@ -11,7 +11,9 @@ import {
 import { ProviderFactory } from '../providers/provider.factory';
 import { ISmsProvider, SendSmsResult } from '../providers/interfaces/sms-provider.interface';
 import { SmsProcessor } from './sms.processor';
+import { ProviderRateLimiter } from './provider-rate-limiter';
 import { SmsDispatchJobData } from './queue.constants';
+import { MetricsService } from '../../observability/metrics.service';
 
 const MESSAGE_ID = 'msg-1';
 
@@ -41,6 +43,14 @@ interface Mocks {
   providerFactory: { getProvider: jest.Mock; getOrderedProviders: jest.Mock };
   encryption: { decrypt: jest.Mock };
   prisma: { smsMessage: { findUnique: jest.Mock } };
+  providerRateLimiter: { acquire: jest.Mock };
+  metrics: {
+    recordProviderAttempt: jest.Mock;
+    recordProviderError: jest.Mock;
+    recordFailover: jest.Mock;
+    recordDeadLetter: jest.Mock;
+    recordProcessingLatency: jest.Mock;
+  };
 }
 
 interface StubProvider {
@@ -89,6 +99,14 @@ function buildMocks(stubs: StubProvider[] = [stubProvider('twilio')]): Mocks {
           .mockResolvedValue({ recipientPhone: '+14155552671', encryptedMessage: 'cipher' }),
       },
     },
+    providerRateLimiter: { acquire: jest.fn().mockResolvedValue(undefined) },
+    metrics: {
+      recordProviderAttempt: jest.fn(),
+      recordProviderError: jest.fn(),
+      recordFailover: jest.fn(),
+      recordDeadLetter: jest.fn(),
+      recordProcessingLatency: jest.fn(),
+    },
   };
 }
 
@@ -98,6 +116,8 @@ function buildProcessor(mocks: Mocks, config: Record<string, unknown> = {}): Sms
     mocks.providerFactory as unknown as ProviderFactory,
     mocks.encryption as unknown as EncryptionService,
     mocks.prisma as unknown as PrismaService,
+    mocks.providerRateLimiter as unknown as ProviderRateLimiter,
+    mocks.metrics as unknown as MetricsService,
     new ConfigService({ PROVIDER_MAX_RETRY_ROUNDS: 3, ...config }),
   );
 }
@@ -122,10 +142,13 @@ describe('SmsProcessor', () => {
     expect(mocks.lifecycle.reserveProviderAttempt.mock.invocationCallOrder[0]!).toBeLessThan(
       twilio.sendSms.mock.invocationCallOrder[0]!,
     );
+    expect(mocks.providerRateLimiter.acquire).toHaveBeenCalledWith('twilio');
     expect(mocks.lifecycle.finalizeProviderAttempt).toHaveBeenCalledWith(MESSAGE_ID, 'attempt-1', {
       outcome: 'ACCEPTED',
       providerMessageId: 'twilio-message-1',
     });
+    expect(mocks.metrics.recordProviderAttempt).toHaveBeenCalledTimes(1);
+    expect(mocks.metrics.recordProcessingLatency).toHaveBeenCalledWith(expect.any(Number));
   });
 
   it('invokes the provider once when a duplicate or restarted job replays after reservation', async () => {
@@ -171,6 +194,7 @@ describe('SmsProcessor', () => {
       isAmbiguous: true,
       isRetryable: true,
       errorMessage: '[timeout] request timed out',
+      ambiguousOutcomeExpiryMs: 900000,
     });
     // Never tries Bird after an ambiguous Twilio outcome.
     expect(bird.sendSms).not.toHaveBeenCalled();
@@ -194,6 +218,7 @@ describe('SmsProcessor', () => {
       isAmbiguous: true,
       isRetryable: false,
       errorMessage: 'Provider accepted response did not include a valid message id',
+      ambiguousOutcomeExpiryMs: 900000,
     });
     expect(bird.sendSms).not.toHaveBeenCalled();
   });
@@ -220,6 +245,8 @@ describe('SmsProcessor', () => {
     expect(bird.sendSms).toHaveBeenCalledTimes(1);
     expect(mocks.lifecycle.reserveProviderAttempt).toHaveBeenNthCalledWith(1, MESSAGE_ID, 'twilio');
     expect(mocks.lifecycle.reserveProviderAttempt).toHaveBeenNthCalledWith(2, MESSAGE_ID, 'bird');
+    expect(mocks.providerRateLimiter.acquire).toHaveBeenNthCalledWith(1, 'twilio');
+    expect(mocks.providerRateLimiter.acquire).toHaveBeenNthCalledWith(2, 'bird');
     expect(mocks.lifecycle.finalizeProviderAttempt).toHaveBeenNthCalledWith(
       1,
       MESSAGE_ID,
@@ -284,6 +311,32 @@ describe('SmsProcessor', () => {
     expect(outcome).toEqual({ status: 'dead-letter', reason: 'permanent' });
     expect(mocks.lifecycle.scheduleRetry).not.toHaveBeenCalled();
     expect(mocks.lifecycle.markFatalFailure).toHaveBeenCalledWith(MESSAGE_ID, 'twilio:failed');
+  });
+
+  it('dead-letters when a completed pass includes a permanent failure', async () => {
+    const twilio = stubProvider('twilio', {
+      success: false,
+      error: '[http] twilio responded with status 400',
+      isRetryable: false,
+      isAmbiguous: false,
+    });
+    const bird = stubProvider('bird', {
+      success: false,
+      error: '[http] bird responded with status 503',
+      isRetryable: true,
+      isAmbiguous: false,
+    });
+    const mocks = buildMocks([twilio, bird]);
+    const processor = buildProcessor(mocks);
+
+    const outcome = await processor.process(job());
+
+    expect(outcome).toEqual({ status: 'dead-letter', reason: 'permanent' });
+    expect(mocks.lifecycle.scheduleRetry).not.toHaveBeenCalled();
+    expect(mocks.lifecycle.markFatalFailure).toHaveBeenCalledWith(
+      MESSAGE_ID,
+      'twilio:failed, bird:failed',
+    );
   });
 
   it('dead-letters once the configured retry-round limit is reached', async () => {

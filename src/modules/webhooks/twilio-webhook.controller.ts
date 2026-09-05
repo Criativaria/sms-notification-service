@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Headers,
   HttpCode,
+  NotFoundException,
   Post,
   RawBodyRequest,
   Req,
@@ -21,17 +22,22 @@ import { WebhooksService, type WebhookAck } from './webhooks.service';
  * callback URL plus the sorted form parameters and constant-time comparing it to the
  * `X-Twilio-Signature` header. Requires `req.rawBody` (NestFactory must be created with
  * `{ rawBody: true }`); an absent raw body is unverifiable and rejected with 400.
+ *
+ * `TWILIO_AUTH_TOKEN` is only required by environment validation when `twilio` is part of
+ * `SMS_PROVIDER_PRIORITY` (see `environment.validation.ts`); on a Bird-only deployment it is
+ * legitimately absent, so this route is reported as not found rather than the controller
+ * failing to construct.
  */
 @Controller('webhooks')
 export class TwilioWebhookController {
-  private readonly authToken: string;
+  private readonly authToken: string | undefined;
   private readonly callbackUrl: string;
 
   constructor(
     configService: ConfigService,
     private readonly webhooksService: WebhooksService,
   ) {
-    this.authToken = configService.getOrThrow<string>('TWILIO_AUTH_TOKEN');
+    this.authToken = configService.get<string>('TWILIO_AUTH_TOKEN');
     const serviceUrl = configService.getOrThrow<string>('SERVICE_URL').replace(/\/+$/, '');
     this.callbackUrl = `${serviceUrl}/webhooks/twilio`;
   }
@@ -42,6 +48,10 @@ export class TwilioWebhookController {
     @Req() request: RawBodyRequest<Request>,
     @Headers('x-twilio-signature') signature: string | undefined,
   ): Promise<WebhookAck> {
+    if (!this.authToken) {
+      throw new NotFoundException('Twilio is not configured on this deployment');
+    }
+
     const rawBody = request.rawBody;
     if (!rawBody) {
       throw new BadRequestException('Missing raw request body');

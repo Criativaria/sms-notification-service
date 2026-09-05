@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   Headers,
   HttpCode,
+  NotFoundException,
   Post,
   RawBodyRequest,
   Req,
@@ -37,16 +38,21 @@ interface BirdWebhookPayload {
  * constant-time compared to the `X-Bird-Signature` header. Requires `req.rawBody`
  * (NestFactory must be created with `{ rawBody: true }`); an absent raw body is
  * unverifiable and rejected with 400.
+ *
+ * `BIRD_WEBHOOK_SIGNING_KEY` is only required by environment validation when `bird` is part
+ * of `SMS_PROVIDER_PRIORITY` (see `environment.validation.ts`); on a Twilio-only deployment
+ * it is legitimately absent, so this route is reported as not found rather than the
+ * controller failing to construct.
  */
 @Controller('webhooks')
 export class BirdWebhookController {
-  private readonly signingKey: string;
+  private readonly signingKey: string | undefined;
 
   constructor(
     configService: ConfigService,
     private readonly webhooksService: WebhooksService,
   ) {
-    this.signingKey = configService.getOrThrow<string>('BIRD_WEBHOOK_SIGNING_KEY');
+    this.signingKey = configService.get<string>('BIRD_WEBHOOK_SIGNING_KEY');
   }
 
   @Post('bird')
@@ -55,6 +61,10 @@ export class BirdWebhookController {
     @Req() request: RawBodyRequest<Request>,
     @Headers('x-bird-signature') signature: string | undefined,
   ): Promise<WebhookAck> {
+    if (!this.signingKey) {
+      throw new NotFoundException('Bird is not configured on this deployment');
+    }
+
     const rawBody = request.rawBody;
     if (!rawBody) {
       throw new BadRequestException('Missing raw request body');

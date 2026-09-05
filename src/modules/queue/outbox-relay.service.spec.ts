@@ -16,6 +16,7 @@ interface Mocks {
   };
   dispatchQueue: { add: jest.Mock };
   deadLetterQueue: { add: jest.Mock };
+  maintenanceQueue: { add: jest.Mock };
   config: { get: jest.Mock };
 }
 
@@ -41,6 +42,7 @@ function buildMocks(): Mocks {
     },
     dispatchQueue: { add: jest.fn().mockResolvedValue(undefined) },
     deadLetterQueue: { add: jest.fn().mockResolvedValue(undefined) },
+    maintenanceQueue: { add: jest.fn().mockResolvedValue(undefined) },
     config: { get: jest.fn().mockReturnValue(undefined) },
   };
 }
@@ -49,6 +51,7 @@ function buildRelay(mocks: Mocks): OutboxRelayService {
   return new OutboxRelayService(
     mocks.dispatchQueue as unknown as Queue<SmsDispatchJobData>,
     mocks.deadLetterQueue as unknown as Queue<SmsDispatchJobData>,
+    mocks.maintenanceQueue as unknown as Queue<SmsDispatchJobData>,
     mocks.lifecycle as unknown as SmsLifecycleRepository,
     mocks.config as unknown as ConfigService,
   );
@@ -69,13 +72,13 @@ describe('OutboxRelayService', () => {
       1,
       'dispatch',
       { messageId: 'msg-1' },
-      { jobId: 'outbox-1' },
+      { jobId: 'msg-1#outbox-1', removeOnComplete: true, removeOnFail: true },
     );
     expect(mocks.dispatchQueue.add).toHaveBeenNthCalledWith(
       2,
       'dispatch',
       { messageId: 'msg-2' },
-      { jobId: 'outbox-2' },
+      { jobId: 'msg-2#outbox-2', removeOnComplete: true, removeOnFail: true },
     );
     expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-1');
     expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-2');
@@ -97,7 +100,7 @@ describe('OutboxRelayService', () => {
     expect(mocks.lifecycle.markOutboxPublished).not.toHaveBeenCalled();
   });
 
-  it('routes a retry event to a delayed dispatch job with an event-derived job id', async () => {
+  it('routes a retry event to a delayed dispatch job with a message- and event-derived job id', async () => {
     const mocks = buildMocks();
     mocks.lifecycle.fetchUnpublishedOutbox.mockResolvedValue([
       event({
@@ -113,12 +116,39 @@ describe('OutboxRelayService', () => {
     expect(mocks.dispatchQueue.add).toHaveBeenCalledWith(
       'retry',
       { messageId: 'msg-1' },
-      { jobId: 'outbox-retry-1', delay: 2000 },
+      { jobId: 'msg-1#outbox-retry-1', delay: 2000, removeOnComplete: true, removeOnFail: true },
     );
     expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-retry-1');
   });
 
-  it('routes a dead-letter event to the DLQ with an event-derived job id', async () => {
+  it('routes an ambiguous-outcome expiry event to one delayed maintenance job', async () => {
+    const mocks = buildMocks();
+    mocks.lifecycle.fetchUnpublishedOutbox.mockResolvedValue([
+      event({
+        id: 'outbox-expiry-1',
+        eventType: 'SMS_AMBIGUOUS_OUTCOME_EXPIRY_SCHEDULED',
+        payload: { messageId: 'msg-1', delayMs: 900000 },
+      }),
+    ]);
+    const relay = buildRelay(mocks);
+
+    await relay.tick();
+
+    expect(mocks.maintenanceQueue.add).toHaveBeenCalledWith(
+      'ambiguous-outcome-expiry',
+      { messageId: 'msg-1' },
+      {
+        jobId: 'msg-1#outbox-expiry-1',
+        delay: 900000,
+        removeOnComplete: true,
+        removeOnFail: true,
+      },
+    );
+    expect(mocks.dispatchQueue.add).not.toHaveBeenCalled();
+    expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-expiry-1');
+  });
+
+  it('routes a dead-letter event to the DLQ with a message- and event-derived job id', async () => {
     const mocks = buildMocks();
     mocks.lifecycle.fetchUnpublishedOutbox.mockResolvedValue([
       event({ id: 'outbox-dlq-1', eventType: 'SMS_DEAD_LETTERED' }),
@@ -130,13 +160,13 @@ describe('OutboxRelayService', () => {
     expect(mocks.deadLetterQueue.add).toHaveBeenCalledWith(
       'dead-letter',
       { messageId: 'msg-1' },
-      { jobId: 'outbox-dlq-1' },
+      { jobId: 'msg-1#outbox-dlq-1', removeOnComplete: true, removeOnFail: true },
     );
     expect(mocks.dispatchQueue.add).not.toHaveBeenCalled();
     expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-dlq-1');
   });
 
-  it('routes a requeue event to a fresh dispatch job with an event-derived job id', async () => {
+  it('routes a requeue event to a fresh dispatch job with a message- and event-derived job id', async () => {
     const mocks = buildMocks();
     mocks.lifecycle.fetchUnpublishedOutbox.mockResolvedValue([
       event({ id: 'outbox-requeue-1', eventType: 'SMS_REQUEUED' }),
@@ -148,9 +178,26 @@ describe('OutboxRelayService', () => {
     expect(mocks.dispatchQueue.add).toHaveBeenCalledWith(
       'requeue',
       { messageId: 'msg-1' },
-      { jobId: 'outbox-requeue-1' },
+      { jobId: 'msg-1#outbox-requeue-1', removeOnComplete: true, removeOnFail: true },
     );
     expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-requeue-1');
+  });
+
+  it('routes a recovered processing event to a fresh dispatch job', async () => {
+    const mocks = buildMocks();
+    mocks.lifecycle.fetchUnpublishedOutbox.mockResolvedValue([
+      event({ id: 'outbox-recovery-1', eventType: 'SMS_PROCESSING_RECOVERED' }),
+    ]);
+    const relay = buildRelay(mocks);
+
+    await relay.tick();
+
+    expect(mocks.dispatchQueue.add).toHaveBeenCalledWith(
+      'recovered',
+      { messageId: 'msg-1' },
+      { jobId: 'msg-1#outbox-recovery-1', removeOnComplete: true, removeOnFail: true },
+    );
+    expect(mocks.lifecycle.markOutboxPublished).toHaveBeenCalledWith('outbox-recovery-1');
   });
 
   it('is a no-op when there are no unpublished events', async () => {

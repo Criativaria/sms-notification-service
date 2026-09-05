@@ -26,6 +26,10 @@ describe('validateEnvironment', () => {
       IDEMPOTENCY_TTL_HOURS: 24,
       PROVIDER_MAX_RETRY_ROUNDS: 3,
       SMS_PROVIDER_TPS: 10,
+      PROCESSING_RECOVERY_INTERVAL_MS: 60000,
+      PROCESSING_STALE_AFTER_MS: 300000,
+      PROCESSING_RECOVERY_BATCH_SIZE: 100,
+      AMBIGUOUS_OUTCOME_EXPIRY_MS: 900000,
     });
   });
 
@@ -80,5 +84,11 @@ describe('validateEnvironment', () => {
     expect(validateEnvironment({ ...validEnvironment, PATH: 'system-path' })).toMatchObject(
       validEnvironment,
     );
+  });
+
+  it.each([0, -1, 1.5])('rejects a non-positive expiry duration of %s milliseconds', (value) => {
+    expect(() =>
+      validateEnvironment({ ...validEnvironment, AMBIGUOUS_OUTCOME_EXPIRY_MS: value }),
+    ).toThrow('Environment validation failed');
   });
 });

@@ -17,9 +17,8 @@ import {
   SMS_DISPATCH_QUEUE,
   SmsDispatchJobData,
 } from './queue.constants';
-
-/** Worker rate limit (per-provider TPS ceiling). Read at load time; defaults to 10. */
-const providerTps = Number(process.env.SMS_PROVIDER_TPS) || 10;
+import { ProviderRateLimiter } from './provider-rate-limiter';
+import { MetricsService } from '../../observability/metrics.service';
 
 export type ProcessOutcome =
   | { status: 'skipped' }
@@ -52,32 +51,48 @@ interface PassFailure {
  *   `AWAITING_PROVIDER_RESULT` for audited operator resolution or a provider callback.
  *
  * If every configured provider fails definitively in one pass, the worker schedules an
- * exponential-backoff retry round (only when at least one failure was retryable and the
+ * exponential-backoff retry round (only when every failure was retryable and the
  * configured round limit is not exhausted) or moves the message to `FATAL_FAILURE`/DLQ.
  *
  * Concurrency safety comes from {@link SmsLifecycleRepository.beginProcessing} and
  * {@link SmsLifecycleRepository.reserveProviderAttempt}: only one worker can hold a message
  * at a time, so a duplicated or replayed job is a no-op.
  */
-@Processor(SMS_DISPATCH_QUEUE, { limiter: { max: providerTps, duration: 1000 } })
+@Processor(SMS_DISPATCH_QUEUE)
 export class SmsProcessor extends WorkerHost {
   private readonly logger = new Logger(SmsProcessor.name);
   private readonly maxRetryRounds: number;
   private readonly backoffBaseMs: number;
+  private readonly ambiguousOutcomeExpiryMs: number;
 
   constructor(
     private readonly lifecycle: SmsLifecycleRepository,
     private readonly providerFactory: ProviderFactory,
     private readonly encryption: EncryptionService,
     private readonly prisma: PrismaService,
+    private readonly providerRateLimiter: ProviderRateLimiter,
+    private readonly metrics: MetricsService,
     configService: ConfigService,
   ) {
     super();
     this.maxRetryRounds = readPositiveInt(configService.get('PROVIDER_MAX_RETRY_ROUNDS'), 3);
     this.backoffBaseMs = DEFAULT_RETRY_BACKOFF_BASE_MS;
+    this.ambiguousOutcomeExpiryMs = readPositiveInt(
+      configService.get('AMBIGUOUS_OUTCOME_EXPIRY_MS'),
+      900_000,
+    );
   }
 
   async process(job: Job<SmsDispatchJobData>): Promise<ProcessOutcome> {
+    const startedAt = Date.now();
+    try {
+      return await this.processDispatch(job);
+    } finally {
+      this.metrics.recordProcessingLatency(Date.now() - startedAt);
+    }
+  }
+
+  private async processDispatch(job: Job<SmsDispatchJobData>): Promise<ProcessOutcome> {
     const { messageId } = job.data;
 
     const begin = await this.lifecycle.beginProcessing(messageId);
@@ -112,6 +127,8 @@ export class SmsProcessor extends WorkerHost {
         return { status: 'skipped' };
       }
 
+      await this.providerRateLimiter.acquire(provider.providerName);
+      this.metrics.recordProviderAttempt();
       const result = await provider.sendSms({
         to: row.recipientPhone,
         body,
@@ -128,12 +145,14 @@ export class SmsProcessor extends WorkerHost {
       }
 
       const { isAmbiguous, isRetryable, errorMessage } = classify(result);
+      this.metrics.recordProviderError();
 
       await this.lifecycle.finalizeProviderAttempt(messageId, reservation.attemptId, {
         outcome: 'FAILED',
         isAmbiguous,
         isRetryable,
         errorMessage,
+        ...(isAmbiguous ? { ambiguousOutcomeExpiryMs: this.ambiguousOutcomeExpiryMs } : {}),
       });
 
       if (isAmbiguous) {
@@ -147,6 +166,7 @@ export class SmsProcessor extends WorkerHost {
         `PROVIDER_ATTEMPT_FAILED messageId=${messageId} provider=${provider.providerName} retryable=${isRetryable}`,
       );
       if (providers.indexOf(provider) < providers.length - 1) {
+        this.metrics.recordFailover();
         this.logger.warn(`PROVIDER_FAILOVER messageId=${messageId} from=${provider.providerName}`);
       }
       passFailures.push({ providerName: provider.providerName, isRetryable });
@@ -155,11 +175,12 @@ export class SmsProcessor extends WorkerHost {
     // Every configured provider produced a definitive failure this pass (or none are
     // configured). Decide whether another round is worthwhile.
     return this.guardConcurrency(messageId, async () => {
-      const anyRetryable = passFailures.some((failure) => failure.isRetryable);
+      const allRetryable =
+        passFailures.length > 0 && passFailures.every((failure) => failure.isRetryable);
       const currentRound = begin.message.retryRounds;
       const summary = summarizeFailures(passFailures);
 
-      if (anyRetryable && currentRound < this.maxRetryRounds) {
+      if (allRetryable && currentRound < this.maxRetryRounds) {
         const delayMs = backoffDelayMs(currentRound, this.backoffBaseMs);
         await this.lifecycle.scheduleRetry(messageId, {
           incrementRound: true,
@@ -173,10 +194,11 @@ export class SmsProcessor extends WorkerHost {
       }
 
       await this.lifecycle.markFatalFailure(messageId, summary);
+      this.metrics.recordDeadLetter();
       this.logger.warn(`MESSAGE_DEAD_LETTERED messageId=${messageId} reason=${summary}`);
       return {
         status: 'dead-letter',
-        reason: anyRetryable ? 'rounds-exhausted' : 'permanent',
+        reason: allRetryable ? 'rounds-exhausted' : 'permanent',
       };
     });
   }
